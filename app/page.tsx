@@ -9,8 +9,8 @@
 // last (the Store enforces NULLs-last); they are NEVER shown as 0.
 
 import React from "react";
+import Link from "next/link";
 import { getDashboardData, parseSortKey, type SortKey } from "./dashboard-data.js";
-import { RunPipelineButton } from "./RunPipelineButton.js";
 import type { AnalysisStatus, Beat, ReelRow } from "../lib/core/types.js";
 
 export const dynamic = "force-dynamic";
@@ -81,8 +81,14 @@ export default async function HomePage({ searchParams }: PageProps) {
             {category ? ` · ${categoryLabel(category)}` : ""}
           </p>
         </div>
-        {/* Client island: the only client-side JS on the page (table stays SSR). */}
-        <RunPipelineButton defaultCreator={creator} />
+        {/* Launch + watch runs on the dedicated monitor page (per-step progress +
+            live results). The table here stays fully server-rendered. */}
+        <Link
+          href={creator ? `/runs?creator=${encodeURIComponent(creator)}` : "/runs"}
+          style={styles.runLink}
+        >
+          Run pipeline →
+        </Link>
       </header>
 
       <section style={styles.controls} aria-label="sort and filter">
@@ -374,6 +380,7 @@ const styles: Record<string, React.CSSProperties> = {
   controlLabel: { fontSize: "0.75rem", textTransform: "uppercase", letterSpacing: "0.05em", color: "#999", marginRight: "0.25rem" },
   pill: { padding: "0.3rem 0.7rem", borderRadius: 999, border: "1px solid #ddd", background: "#fff", color: "#333", textDecoration: "none", fontSize: "0.85rem" },
   pillActive: { padding: "0.3rem 0.7rem", borderRadius: 999, border: "1px solid #111", background: "#111", color: "#fff", textDecoration: "none", fontSize: "0.85rem" },
+  runLink: { padding: "0.45rem 1rem", borderRadius: 6, border: "1px solid #111", background: "#111", color: "#fff", textDecoration: "none", fontSize: "0.85rem", fontWeight: 600, whiteSpace: "nowrap" },
   empty: { color: "#666", fontSize: "0.95rem", padding: "2rem 0" },
   tableWrap: { overflowX: "auto", border: "1px solid #eee", borderRadius: 8 },
   table: { borderCollapse: "collapse", width: "100%", fontSize: "0.85rem" },

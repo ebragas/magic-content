@@ -18,6 +18,7 @@
 import { pipeline } from "../../../../lib/core/pipeline.js";
 import type { PipelineAction } from "../../../../lib/core/types.js";
 import {
+  getActiveOrLatestRun,
   isRunActive,
   markFailed,
   markRunning,
@@ -40,6 +41,13 @@ function isAction(v: unknown): v is PipelineAction {
 interface RunRequestBody {
   action?: unknown;
   creator?: unknown;
+}
+
+// GET the active (or most-recent) run so the monitor page can attach to an
+// in-flight run without knowing its run_id (e.g. on a fresh page load mid-run).
+// Returns { run: null } when no run has ever started. Pure registry read.
+export async function GET(): Promise<Response> {
+  return Response.json({ run: getActiveOrLatestRun() }, { status: 200 });
 }
 
 export async function POST(request: Request): Promise<Response> {

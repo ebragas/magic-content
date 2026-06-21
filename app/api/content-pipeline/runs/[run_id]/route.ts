@@ -33,6 +33,7 @@ export async function GET(
     status: run.status,
     stage: run.stage,
     progress: run.progress,
+    steps: run.steps,
     started_at: run.started_at,
     finished_at: run.finished_at,
   };
