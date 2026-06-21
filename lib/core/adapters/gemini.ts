@@ -3,10 +3,12 @@
 // port) never load the SDK and never make a network call (HARD INVARIANT #2).
 //
 // The shared-upload lifecycle (upload -> poll until ACTIVE -> use for BOTH the
-// transcription and the analysis call -> delete) lives in analyze.ts; this adapter
-// is the thin per-call seam. Each call uploads its own file because the GeminiPort
-// contract is per-call and file-handle-free — keeping the port simple and fakeable.
-// The transient .mp4 on disk is still downloaded once and deleted once by analyze.
+// transcription and the analysis call -> delete) is driven by analyze.ts via the
+// prepareVideo/releaseVideo seam: analyze uploads each Reel's Video ONCE, passes the
+// resulting handle to BOTH generateContent calls, then releases it — so the .mp4 is
+// uploaded once and polled-to-ACTIVE once per Reel (not twice). When no handle is
+// passed (e.g. a future caller that skips prepareVideo) each call still uploads its
+// own file from `videoPath` and cleans it up, keeping every method self-sufficient.
 
 import { readFileSync } from "node:fs";
 import {
@@ -22,6 +24,7 @@ import type {
   GeminiAnalysisResult,
   GeminiPort,
   GeminiTranscriptResult,
+  GeminiVideoHandle,
 } from "../types.js";
 
 const VIDEO_MIME = "video/mp4";
@@ -107,13 +110,30 @@ function fileToPart(file: GeminiFile) {
   return createPartFromUri(file.uri, file.mimeType);
 }
 
+/** Narrow an opaque handle back to a Gemini File (only this adapter mints them). */
+function asGeminiFile(handle: GeminiVideoHandle): GeminiFile {
+  return handle as GeminiFile;
+}
+
 /** Build the real GeminiPort. Reads GEMINI_API_KEY at construction time. */
 export function makeGeminiPort(): GeminiPort {
   const ai = new GoogleGenAI({ apiKey: getApiKey() });
 
   return {
-    async transcribe({ videoPath, prompt, model }): Promise<GeminiTranscriptResult> {
-      const file = await uploadAndWait(ai, videoPath);
+    async prepareVideo({ videoPath }): Promise<GeminiVideoHandle> {
+      // Upload ONCE + poll to ACTIVE; the handle is reused for both calls below.
+      return uploadAndWait(ai, videoPath);
+    },
+
+    async releaseVideo(handle): Promise<void> {
+      await deleteFile(ai, asGeminiFile(handle));
+    },
+
+    async transcribe({ videoPath, prompt, model, video }): Promise<GeminiTranscriptResult> {
+      // Reuse a pre-uploaded handle when analyze provides one; else upload locally
+      // and own that file's lifecycle (delete only what we uploaded here).
+      const own = video == null;
+      const file = own ? await uploadAndWait(ai, videoPath) : asGeminiFile(video);
       try {
         const response = await ai.models.generateContent({
           model,
@@ -121,12 +141,13 @@ export function makeGeminiPort(): GeminiPort {
         });
         return { transcript: (response.text ?? "").trim() };
       } finally {
-        await deleteFile(ai, file);
+        if (own) await deleteFile(ai, file);
       }
     },
 
-    async analyzeVideo({ videoPath, prompt, model, transcript }): Promise<GeminiAnalysisResult> {
-      const file = await uploadAndWait(ai, videoPath);
+    async analyzeVideo({ videoPath, prompt, model, transcript, video }): Promise<GeminiAnalysisResult> {
+      const own = video == null;
+      const file = own ? await uploadAndWait(ai, videoPath) : asGeminiFile(video);
       try {
         const response = await ai.models.generateContent({
           model,
@@ -143,7 +164,7 @@ export function makeGeminiPort(): GeminiPort {
         const parsed = JSON.parse(raw) as GeminiAnalysisResult;
         return parsed;
       } finally {
-        await deleteFile(ai, file);
+        if (own) await deleteFile(ai, file);
       }
     },
   };

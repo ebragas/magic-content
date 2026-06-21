@@ -3,6 +3,7 @@ export * from "./types.js";
 export * from "./config.js";
 export * from "./metrics.js";
 export { openStore, DEFAULT_DB_PATH } from "./store.js";
+export { normalizeUsername } from "./username.js";
 export { scrape } from "./scrape.js";
 export { analyze, rememberVideoUrl, resetVideoUrlCache } from "./analyze.js";
 export { refresh, pipeline } from "./pipeline.js";

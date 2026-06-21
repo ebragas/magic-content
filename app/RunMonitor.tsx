@@ -82,6 +82,10 @@ const STAGE_LABEL: Record<Stage, string> = {
 };
 
 const POLL_MS = 1200;
+// A single transient poll failure (network blip / dev-server reload) must NOT end
+// the run — the server pipeline keeps going and the run stays active. Tolerate up to
+// this many CONSECUTIVE failures (with a soft "retrying" notice) before giving up.
+const MAX_POLL_FAILURES = 5;
 
 export function RunMonitor({ defaultCreator }: { defaultCreator?: string }) {
   const [action, setAction] = useState<Action>("full");
@@ -92,6 +96,8 @@ export function RunMonitor({ defaultCreator }: { defaultCreator?: string }) {
   const [now, setNow] = useState<number>(() => Date.now());
 
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Count consecutive poll failures so a single transient blip doesn't abort.
+  const pollFailures = useRef(0);
   const mounted = useRef(true);
 
   const isActive = run?.status === "queued" || run?.status === "running";
@@ -117,9 +123,20 @@ export function RunMonitor({ defaultCreator }: { defaultCreator?: string }) {
     async (runId: string) => {
       try {
         const res = await fetch(`/api/content-pipeline/runs/${runId}`, { cache: "no-store" });
+        // A 404 means the registry no longer knows this run — a definitive end
+        // state, not a transient blip — so stop rather than retry forever.
+        if (res.status === 404) {
+          stop();
+          pollFailures.current = 0;
+          if (mounted.current) setError("run not found");
+          return;
+        }
         if (!res.ok) throw new Error(`status check failed (${res.status})`);
         const data = (await res.json()) as RunRecord;
         if (!mounted.current) return;
+        // Got a real status — clear any transient-failure state.
+        pollFailures.current = 0;
+        setError(null);
         setRun(data);
         await fetchResults(data.creator);
         if (data.status === "succeeded" || data.status === "failed") {
@@ -128,8 +145,18 @@ export function RunMonitor({ defaultCreator }: { defaultCreator?: string }) {
         }
         pollTimer.current = setTimeout(() => void tick(runId), POLL_MS);
       } catch (e) {
-        stop();
-        if (mounted.current) setError(e instanceof Error ? e.message : String(e));
+        // Transient failure (network blip / dev-server reload). The server pipeline
+        // is still running, so keep polling instead of aborting the run — until we
+        // exceed MAX_POLL_FAILURES consecutive misses.
+        pollFailures.current += 1;
+        if (pollFailures.current >= MAX_POLL_FAILURES) {
+          stop();
+          pollFailures.current = 0;
+          if (mounted.current) setError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+        if (mounted.current) setError("lost connection, retrying…");
+        pollTimer.current = setTimeout(() => void tick(runId), POLL_MS);
       }
     },
     [fetchResults, stop],
@@ -169,6 +196,7 @@ export function RunMonitor({ defaultCreator }: { defaultCreator?: string }) {
 
   const start = useCallback(async () => {
     setError(null);
+    pollFailures.current = 0;
     try {
       const res = await fetch("/api/content-pipeline/runs", {
         method: "POST",

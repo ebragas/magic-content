@@ -309,6 +309,126 @@ describe("analyze → Content Store (faked Gemini + Video)", () => {
     store.close();
   });
 
+  it("treats the silent-video sentinel as no transcript (stores null, keeps the rest of the analysis) (#6)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["silent"]);
+    // The transcription leg returns the exact sentinel from prompts/transcription.md;
+    // the analysis echo also carries it. Neither should be stored as content.
+    const { port: gemini } = fakeGemini({
+      transcript: "[no speech]",
+      analysisFor: () => analysisResult({ transcript: "[no speech]" }),
+    });
+    const { port: video } = fakeVideo();
+
+    const summary = await analyze({ creator: "c", store, config, deps: { gemini, video } });
+    expect(summary.analyzed).toBe(1);
+
+    const reel = store.getReel("silent")!;
+    // Sentinel normalized to null — not rendered as content, not counted as a transcript.
+    expect(reel.transcript).toBeNull();
+    // The rest of the analysis is intact.
+    expect(reel.analysis_status).toBe("analyzed");
+    expect(reel.topic).toBe("using Claude to triage email");
+    expect(reel.category).toBe("tool_demo");
+    expect(reel.why_it_works).toContain("hook");
+
+    store.close();
+  });
+
+  it("uploads each Video to Gemini ONCE and reuses the handle for both calls (#13)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["R1", "R2"]);
+
+    // A fake that mints a distinct opaque handle per prepareVideo call and records
+    // every method invocation, so we can assert one upload per Reel + handle reuse.
+    const prepared: string[] = [];
+    const released: string[] = [];
+    const transcribeHandles: unknown[] = [];
+    const analyzeHandles: unknown[] = [];
+    let counter = 0;
+    const gemini: GeminiPort = {
+      async prepareVideo({ videoPath }) {
+        counter += 1;
+        const handle = { id: `${videoPath}#${counter}` };
+        prepared.push(videoPath);
+        return handle;
+      },
+      async releaseVideo(handle) {
+        released.push((handle as { id: string }).id);
+      },
+      async transcribe({ video }) {
+        transcribeHandles.push(video);
+        return { transcript: "verbatim" };
+      },
+      async analyzeVideo({ video }) {
+        analyzeHandles.push(video);
+        return analysisResult();
+      },
+    };
+    const { port: video } = fakeVideo();
+
+    await analyze({ creator: "c", store, config, deps: { gemini, video } });
+
+    // Exactly ONE upload per Reel (not two) — the crux of the fix.
+    expect(prepared.sort()).toEqual(["/tmp/R1.mp4", "/tmp/R2.mp4"]);
+    // Both generateContent calls per Reel received the SAME (defined) handle.
+    expect(transcribeHandles).toHaveLength(2);
+    expect(analyzeHandles).toHaveLength(2);
+    for (let i = 0; i < 2; i++) {
+      expect(transcribeHandles[i]).toBeDefined();
+      expect(transcribeHandles[i]).toBe(analyzeHandles[i]);
+    }
+    // Each uploaded handle is released exactly once.
+    expect(released).toHaveLength(2);
+
+    store.close();
+  });
+
+  it("prioritizes never-analyzed Reels ahead of re-analysis candidates under the cap (#4)", async () => {
+    const store = openStore(":memory:");
+    // Newest-first: R0 (newest) .. R3 (oldest). The two NEWEST are already analyzed
+    // but with a DRIFTED analysis hash → they are re-analysis candidates. The two
+    // OLDEST were never analyzed (pending). Cap = 2.
+    seedReels(store, "c", ["R0", "R1", "R2", "R3"]);
+    store.updateReelAnalysis({
+      shortcode: "R0",
+      analysis_status: "analyzed",
+      analyzed_at: "2026-01-01T00:00:00.000Z",
+      transcript: "old R0",
+      transcription_prompt_hash: transcriptionPromptHash(config),
+      analysis_prompt_hash: "deadbeefcafe", // drifted → re-analysis candidate
+    });
+    store.updateReelAnalysis({
+      shortcode: "R1",
+      analysis_status: "analyzed",
+      analyzed_at: "2026-01-01T00:00:00.000Z",
+      transcript: "old R1",
+      transcription_prompt_hash: transcriptionPromptHash(config),
+      analysis_prompt_hash: "deadbeefcafe", // drifted → re-analysis candidate
+    });
+
+    const capped = structuredClone(config);
+    capped.settings.max_analyses_per_run = 2;
+    const { port: gemini } = fakeGemini();
+    const { port: video } = fakeVideo();
+
+    const summary = await analyze({ creator: "c", store, config: capped, deps: { gemini, video } });
+
+    // The cap is spent on the two NEVER-analyzed Reels first — re-analyses starve, not
+    // first-timers. 4 candidates, cap 2 → 2 over cap.
+    expect(summary.analyzed).toBe(2);
+    expect(summary.remainingOverCap).toBe(2);
+    // The two oldest (never-analyzed) got analyzed.
+    expect(store.getReel("R2")!.analysis_status).toBe("analyzed");
+    expect(store.getReel("R3")!.analysis_status).toBe("analyzed");
+    // The two newest (re-analysis candidates) were NOT redone — prior state intact.
+    expect(store.getReel("R0")!.transcript).toBe("old R0");
+    expect(store.getReel("R0")!.analysis_prompt_hash).toBe("deadbeefcafe");
+    expect(store.getReel("R1")!.transcript).toBe("old R1");
+
+    store.close();
+  });
+
   it("no Gemini port + no API key → safe no-op that still reports the over-cap remainder", async () => {
     const store = openStore(":memory:");
     seedReels(store, "c", ["x0", "x1", "x2"]);

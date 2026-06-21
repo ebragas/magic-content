@@ -53,12 +53,21 @@ function buildHref(
   return qs ? `/?${qs}` : "/";
 }
 
-/** Human label for a Category slug (e.g. tool_demo → "Tool Demo"). */
-function categoryLabel(slug: string): string {
-  return slug
-    .split("_")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
+/**
+ * Human label for a Category slug, resolved from the authored names in
+ * config/categories.yaml (the single source of truth the analysis prompt is
+ * parameterized from), e.g. story_personal → "Story/Personal". A pure lookup over
+ * the map assembled in getDashboardData; falls back to title-casing the slug ONLY
+ * for a slug not present in config (defensive — should not happen for stored Reels).
+ */
+function categoryLabel(slug: string, names: Record<string, string>): string {
+  return (
+    names[slug] ??
+    slug
+      .split("_")
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ")
+  );
 }
 
 export default async function HomePage({ searchParams }: PageProps) {
@@ -78,7 +87,7 @@ export default async function HomePage({ searchParams }: PageProps) {
           <p style={styles.subtitle}>
             {data.total} Reel{data.total === 1 ? "" : "s"} in the Content Store
             {creator ? ` · @${creator}` : ""}
-            {category ? ` · ${categoryLabel(category)}` : ""}
+            {category ? ` · ${categoryLabel(category, data.categoryNames)}` : ""}
           </p>
         </div>
         {/* Launch + watch runs on the dedicated monitor page (per-step progress +
@@ -128,7 +137,7 @@ export default async function HomePage({ searchParams }: PageProps) {
               href={buildHref(sort, viralOnly, creator, slug)}
               style={category === slug ? styles.pillActive : styles.pill}
             >
-              {categoryLabel(slug)}
+              {categoryLabel(slug, data.categoryNames)}
             </a>
           ))}
         </div>
@@ -199,7 +208,7 @@ export default async function HomePage({ searchParams }: PageProps) {
                     <td style={styles.tdLeft}>{textOrDash(reel.topic)}</td>
                     <td style={styles.tdLeft}>
                       {reel.category ? (
-                        <span style={styles.catBadge}>{categoryLabel(reel.category)}</span>
+                        <span style={styles.catBadge}>{categoryLabel(reel.category, data.categoryNames)}</span>
                       ) : (
                         <span style={styles.muted}>—</span>
                       )}

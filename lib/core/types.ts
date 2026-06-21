@@ -246,15 +246,44 @@ export interface GeminiAnalysisResult {
   why_it_works: string;
 }
 
+/**
+ * Opaque handle to a video already uploaded to Gemini's Files API and polled to
+ * ACTIVE. Lets analyze upload a Reel's Video ONCE and reuse it for BOTH the
+ * transcription and the analysis call (one upload, two generateContent calls).
+ * Its shape is the real adapter's private business; callers treat it as opaque.
+ */
+export type GeminiVideoHandle = unknown;
+
 export interface GeminiPort {
-  /** Transcribe a local video file verbatim using the given prompt. */
-  transcribe(args: { videoPath: string; prompt: string; model: string }): Promise<GeminiTranscriptResult>;
-  /** Run lean-core analysis on a local video file using the given (rendered) prompt. */
+  /**
+   * Upload a local video to Gemini ONCE and wait until it's ACTIVE, returning a
+   * reusable handle. Optional: when a port doesn't implement it (test fakes),
+   * analyze falls back to per-call upload via `videoPath`. Pair with releaseVideo.
+   */
+  prepareVideo?(args: { videoPath: string }): Promise<GeminiVideoHandle>;
+  /** Delete a previously-uploaded video handle (best-effort). */
+  releaseVideo?(handle: GeminiVideoHandle): Promise<void>;
+  /**
+   * Transcribe a video verbatim using the given prompt. Pass a `video` handle from
+   * prepareVideo to reuse a single upload; otherwise the adapter uploads `videoPath`.
+   */
+  transcribe(args: {
+    videoPath: string;
+    prompt: string;
+    model: string;
+    video?: GeminiVideoHandle;
+  }): Promise<GeminiTranscriptResult>;
+  /**
+   * Run lean-core analysis on a video using the given (rendered) prompt. Pass a
+   * `video` handle from prepareVideo to reuse a single upload; otherwise the adapter
+   * uploads `videoPath`.
+   */
   analyzeVideo(args: {
     videoPath: string;
     prompt: string;
     model: string;
     transcript: string;
+    video?: GeminiVideoHandle;
   }): Promise<GeminiAnalysisResult>;
 }
 

@@ -12,6 +12,7 @@
 // and their import.meta.url path tricks — into the webpack server bundle. The Store
 // API surface here is exactly the one the pipeline writes through (ADR-0002).
 import { openStore } from "../lib/core/store.js";
+import { loadConfig } from "../lib/core/config.js";
 import type {
   ReelRow,
   Store,
@@ -32,6 +33,19 @@ const SORT_TO_ORDER_BY: Record<SortKey, NonNullable<ListReelsOptions["orderBy"]>
   virality: "is_viral",
   category: "category",
   posted_at: "posted_at",
+};
+
+/**
+ * Sort direction per axis. Numeric/recency axes read best-first (DESC) so the
+ * strongest Reels surface at the top; `category` is a free-text enum, so it reads
+ * ascending (natural alphabetical) — DESC would sort categories backwards
+ * (tool_demo, story_personal, …). NULLs sort last in either direction (Store rule).
+ */
+const SORT_TO_DIRECTION: Record<SortKey, NonNullable<ListReelsOptions["direction"]>> = {
+  performance: "desc",
+  virality: "desc",
+  category: "asc",
+  posted_at: "desc",
 };
 
 export function parseSortKey(raw: string | undefined): SortKey {
@@ -61,6 +75,12 @@ export interface DashboardData {
   category?: string;
   /** All Category slugs present in the (creator-scoped) store — drives the filter UI. */
   categoriesPresent: string[];
+  /**
+   * Authored Category display names keyed by slug, from config/categories.yaml —
+   * the single source of truth the analysis prompt is parameterized from. The UI
+   * looks labels up here (falling back to title-case only for slugs not in config).
+   */
+  categoryNames: Record<string, string>;
 }
 
 export interface DashboardQuery {
@@ -93,11 +113,12 @@ export function getDashboardData(
   const s = store ?? openStore();
   try {
     // The Store enforces NULLs-last regardless of direction; performance/virality
-    // read best-first (DESC), so the strongest Reels surface at the top.
+    // read best-first (DESC) so the strongest Reels surface at the top, while
+    // `category` reads ascending (natural alphabetical) — see SORT_TO_DIRECTION.
     const reels = s.listReels({
       creator: query.creator,
       orderBy: SORT_TO_ORDER_BY[sort],
-      direction: "desc",
+      direction: SORT_TO_DIRECTION[sort],
     });
 
     // Cache latest-stats per creator so we don't re-query for every Reel.
@@ -109,6 +130,14 @@ export function getDashboardData(
     const categoriesPresent = Array.from(
       new Set(reels.map((r) => r.category).filter((c): c is string => !!c)),
     ).sort();
+
+    // Authored slug→name map from config/categories.yaml (the prompt's source of
+    // truth). The UI resolves Category labels from this rather than re-deriving a
+    // name by title-casing the slug, so e.g. story_personal renders "Story/Personal".
+    const categoryNames: Record<string, string> = {};
+    for (const c of loadConfig().categories.categories) {
+      categoryNames[c.slug] = c.name;
+    }
 
     // Category filter applied in JS (same pattern as the Virality filter); the
     // already-ordered list is preserved.
@@ -131,7 +160,7 @@ export function getDashboardData(
       };
     });
 
-    return { rows, total: rows.length, sort, viralOnly, category, categoriesPresent };
+    return { rows, total: rows.length, sort, viralOnly, category, categoriesPresent, categoryNames };
   } finally {
     if (ownsStore) s.close();
   }

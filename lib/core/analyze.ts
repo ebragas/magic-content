@@ -2,10 +2,16 @@
 // capped, with prompt-hash provenance (ADR-0003/0004).
 //
 // Per un-analyzed Reel, NEWEST-FIRST, up to max_analyses_per_run:
-//   download the transient Video -> upload to Gemini -> run TWO externalized
-//   prompts (verbatim transcription, then lean-core analysis with the Category list
-//   injected from config/categories.yaml) -> store the lean-core fields + provenance
-//   hashes -> DELETE the Video (CONTEXT.md: only the thumbnail is kept).
+//   download the transient Video -> upload to Gemini ONCE (prepareVideo) -> run TWO
+//   externalized prompts against that single upload (verbatim transcription, then
+//   lean-core analysis with the Category list injected from config/categories.yaml)
+//   -> store the lean-core fields + provenance hashes -> release the Gemini upload +
+//   DELETE the local Video (CONTEXT.md: only the thumbnail is kept).
+//
+// First-time (never-analyzed) Reels are queued AHEAD of re-analysis candidates so a
+// prompt/category edit can never starve first-time analyses out of the cap (#4).
+// A missing fresh Video URL is a SKIP, not a failure (#2); a FAILED re-analysis
+// preserves the prior success instead of overwriting it with a red badge (#5).
 //
 // External I/O (Gemini + the Video download/file lifecycle) is dependency-injected
 // through ports (HARD INVARIANT #2): tests fake ONLY those ports and assert on the
@@ -33,6 +39,7 @@ import {
   renderAnalysisPrompt,
   transcriptionPromptHash,
 } from "./config.js";
+import { normalizeUsername } from "./username.js";
 import type {
   AnalyzeResultSummary,
   Beat,
@@ -40,6 +47,7 @@ import type {
   Deps,
   GeminiAnalysisResult,
   GeminiPort,
+  GeminiVideoHandle,
   OnProgress,
   ReelRow,
   Store,
@@ -52,6 +60,25 @@ export interface AnalyzeArgs {
   config?: AppConfig;
   deps?: Deps;
   onProgress?: OnProgress;
+}
+
+/**
+ * Silent-video sentinel mandated by prompts/transcription.md ("If there is no
+ * spoken audio ... output exactly: `[no speech]`"). It is NOT real content: stored
+ * as a null transcript so the dashboard doesn't render the literal token and
+ * hasAnalysis doesn't count it as a transcript. Kept in sync with that prompt.
+ */
+const NO_SPEECH_SENTINEL = "[no speech]";
+
+/**
+ * Normalize a verbatim transcript for storage: trim, and map the silent-video
+ * sentinel (and the empty string) to null so "no speech" is never stored as
+ * content. The rest of the analysis (topic/category/etc.) is unaffected.
+ */
+function normalizeTranscript(raw: string | null | undefined): string | null {
+  const text = (raw ?? "").trim();
+  if (text === "" || text === NO_SPEECH_SENTINEL) return null;
+  return text;
 }
 
 const BEAT_LABELS: ReadonlySet<string> = new Set<BeatLabel>([
@@ -115,6 +142,18 @@ function needsAnalysis(
   );
 }
 
+/**
+ * A re-analysis candidate is a Reel that already carries a successful analysis
+ * (analysis_status === "analyzed") and is only being revisited because a producing
+ * prompt's hash drifted (ADR-0004). A first-time candidate is anything else
+ * (pending / failed / null). This split drives both cap prioritization (#4: never
+ * starve first-time analyses) and failure handling (#5: never destroy a prior
+ * success on a failed re-analysis).
+ */
+function isReanalysisCandidate(reel: ReelRow): boolean {
+  return reel.analysis_status === "analyzed";
+}
+
 /** Validate the model's category against the governed enum; throw on miss. */
 function validateCategory(category: string, config: AppConfig): string {
   const slug = (category ?? "").trim();
@@ -162,16 +201,21 @@ async function resolvePorts(
 }
 
 /**
- * Analyze a creator's un-analyzed Reels, NEWEST-FIRST, stopping at
- * `max_analyses_per_run`. Reels beyond the cap are left un-analyzed and REPORTED
- * (no silent truncation). Each analyzed Reel stamps both prompt hashes + analyzed_at
- * and sets analysis_status = "analyzed"; a per-Reel failure is recorded
- * (analysis_status = "failed", analysis_error set) and the run continues.
+ * Analyze a creator's candidate Reels, first-time-before-re-analysis and NEWEST-FIRST
+ * within each group, stopping at `max_analyses_per_run` (#4). Reels beyond the cap are
+ * left un-analyzed and REPORTED (no silent truncation). Each analyzed Reel stamps both
+ * prompt hashes + analyzed_at and sets analysis_status = "analyzed".
+ *
+ * Per-Reel outcomes when work can't complete (run always continues):
+ *   - No fresh Video URL → SKIPPED, prior state untouched, counted in `skipped` (#2).
+ *   - First-time failure (no prior success) → analysis_status = "failed" + error.
+ *   - Re-analysis failure (had a prior success) → prior analysis + hashes preserved,
+ *     only analysis_error recorded, so it stays a re-analysis candidate to retry (#5).
  */
 export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> {
   const { creator, store } = args;
   const config = args.config ?? loadConfig();
-  const username = creator.toLowerCase().replace(/^@/, "");
+  const username = normalizeUsername(creator);
 
   const { gemini, video } = await resolvePorts(args.deps);
 
@@ -190,7 +234,16 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
     needsAnalysis(r, currentTranscriptionHash, currentAnalysisHash),
   );
 
-  const toAnalyze = candidates.slice(0, cap);
+  // Prioritize NEVER-analyzed (first-time) Reels ahead of re-analysis candidates so
+  // a categories.yaml/prompt edit can never starve first-time analyses: after such an
+  // edit the newest already-analyzed Reels would otherwise eat the whole cap. Both
+  // groups stay newest-first (candidates is already posted_at DESC); re-analyses
+  // consume only the cap budget left over after every first-timer is queued (#4).
+  const firstTime = candidates.filter((r) => !isReanalysisCandidate(r));
+  const reanalysis = candidates.filter((r) => isReanalysisCandidate(r));
+  const prioritized = [...firstTime, ...reanalysis];
+
+  const toAnalyze = prioritized.slice(0, cap);
   const remainingOverCap = candidates.length - toAnalyze.length;
   const total = toAnalyze.length;
 
@@ -206,33 +259,55 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
 
   let analyzed = 0;
   let failed = 0;
+  // Reels we couldn't even attempt because no fresh Video URL was available (cache
+  // miss with nothing durable to re-resolve from). These are SKIPPED — never failed —
+  // so a missing URL is not a durable red regression decided by entry point (#2).
+  let urlMissSkipped = 0;
   let done = 0;
 
   for (const reel of toAnalyze) {
+    const reanalysis = isReanalysisCandidate(reel);
+
+    // (#2) A missing Video URL must NOT mark the Reel failed. v1 doesn't persist the
+    // expiring CDN videoUrl (docs/schema.md) and the Reel's canonical URL is the
+    // instagram.com page, not a downloadable .mp4 — so with no cached URL there is
+    // genuinely nothing to fetch. Skip (count as skipped), leaving the Reel's prior
+    // state intact so it retries on the next run with a current scrape:
+    //   - a first-time candidate stays pending (untouched),
+    //   - a re-analysis candidate keeps its prior success + un-advanced hashes,
+    //     so it remains a re-analysis candidate (mirrors the #5 failure contract).
     const videoUrl = getVideoUrl(reel);
+    if (!videoUrl) {
+      urlMissSkipped += 1;
+      done += 1;
+      args.onProgress?.("analyze", done, total);
+      continue;
+    }
+
     let videoPath: string | null = null;
+    // (#13) Upload each Reel's Video to Gemini ONCE and reuse the handle for BOTH the
+    // transcription and the analysis call, halving upload bytes + poll waits.
+    let videoHandle: GeminiVideoHandle | undefined;
     try {
-      if (!videoUrl) {
-        throw new Error(
-          "no Video URL available to download (re-analysis requires a fresh scrape — build-spec.md)",
-        );
-      }
       videoPath = await video.downloadVideo({ url: videoUrl, shortcode: reel.shortcode });
+      videoHandle = await gemini.prepareVideo?.({ videoPath });
 
       // 1) Verbatim transcription (prompts/transcription.md).
       const { transcript } = await gemini.transcribe({
         videoPath,
         prompt: transcriptionPrompt,
         model,
+        video: videoHandle,
       });
 
       // 2) Lean-core analysis (prompts/video-analysis.md, categories injected) — the
-      // same uploaded Video conceptually; the analysis call gets the transcript too.
+      // SAME uploaded Video (videoHandle); the analysis call gets the transcript too.
       const analysis: GeminiAnalysisResult = await gemini.analyzeVideo({
         videoPath,
         prompt: analysisPrompt,
         model,
         transcript,
+        video: videoHandle,
       });
 
       const category = validateCategory(analysis.category, config);
@@ -240,8 +315,10 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
 
       store.updateReelAnalysis({
         shortcode: reel.shortcode,
-        // Prefer the verbatim transcript; fall back to the analysis echo.
-        transcript: transcript || analysis.transcript || null,
+        // (#6) Prefer the verbatim transcript; fall back to the analysis echo. The
+        // silent-video sentinel and empty string normalize to null (not content).
+        transcript:
+          normalizeTranscript(transcript) ?? normalizeTranscript(analysis.transcript),
         topic: analysis.topic ?? null,
         category,
         hook_technique: coerceHookTechnique(analysis.hook_technique),
@@ -255,13 +332,37 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
       });
       analyzed += 1;
     } catch (err) {
-      store.updateReelAnalysis({
-        shortcode: reel.shortcode,
-        analysis_status: "failed",
-        analysis_error: err instanceof Error ? err.message : String(err),
-      });
+      const message = err instanceof Error ? err.message : String(err);
+      // (#5) Distinguish first-time failure from re-analysis failure:
+      //   - NO prior success → record status=failed + error (today's behavior).
+      //   - HAD a prior success (re-analysis) → do NOT destroy it: preserve the prior
+      //     analysis fields and do NOT advance the prompt hashes, so the Reel remains
+      //     a re-analysis candidate and retries next run. Record the error WITHOUT
+      //     claiming success — analysis_status stays "analyzed" (the prior success),
+      //     never a green analysis wearing a red 'failed' badge, and the provenance
+      //     hash contract (stored hash drifted vs current) stays honest.
+      if (reanalysis) {
+        store.updateReelAnalysis({
+          shortcode: reel.shortcode,
+          analysis_error: message,
+        });
+      } else {
+        store.updateReelAnalysis({
+          shortcode: reel.shortcode,
+          analysis_status: "failed",
+          analysis_error: message,
+        });
+      }
       failed += 1;
     } finally {
+      // Release the single Gemini upload (best-effort) before deleting the local .mp4.
+      if (videoHandle !== undefined && gemini.releaseVideo) {
+        try {
+          await gemini.releaseVideo(videoHandle);
+        } catch {
+          // Remote cleanup is best-effort; files expire on their own.
+        }
+      }
       // Always DELETE the transient Video — only the thumbnail is kept (CONTEXT.md).
       if (videoPath) {
         try {
@@ -275,8 +376,10 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
     }
   }
 
-  // `skipped` = already-analyzed Reels that didn't count against the cap (build-spec.md).
-  const skipped = all.length - candidates.length;
+  // `skipped` = already-up-to-date Reels that weren't candidates (build-spec.md) PLUS
+  // candidates we couldn't attempt for lack of a fresh Video URL (#2) — both are
+  // skipped, not failed.
+  const skipped = all.length - candidates.length + urlMissSkipped;
   return { creator: username, analyzed, skipped, failed, remainingOverCap };
 }
 
@@ -285,7 +388,8 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
  * CDN videoUrl on the Reel row (docs/schema.md), so analyze depends on a current
  * scrape carrying it in-process (build-spec.md: "Re-analysis implies a re-scrape").
  * When run standalone with no cached URL, the Reel canonical URL is not a
- * downloadable .mp4, so there's nothing to fetch — the Reel is recorded as failed.
+ * downloadable .mp4, so there's nothing to fetch — the Reel is SKIPPED (left in its
+ * prior state to retry on the next scrape-backed run), never marked failed (#2).
  */
 function getVideoUrl(reel: ReelRow): string | null {
   return videoUrlCache.get(reel.shortcode) ?? null;

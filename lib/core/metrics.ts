@@ -16,6 +16,7 @@
 // persists them through the Store's updateReelMetrics).
 
 import type { Store } from "./types.js";
+import { normalizeUsername } from "./username.js";
 
 export interface DerivedMetrics {
   performance_score: number | null;
@@ -120,7 +121,7 @@ export function recomputeAndPersistDerived(
   store: Store,
   username: string,
 ): RecomputeDerivedResult {
-  const creator = username.toLowerCase().replace(/^@/, "");
+  const creator = normalizeUsername(username);
   const followers = store.getLatestStats(creator)?.followers ?? null;
   const reels = store.listReels({ creator });
 
