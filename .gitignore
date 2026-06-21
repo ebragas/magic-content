@@ -1,0 +1,17 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next
+/out
+
+# content store + media (durable but local-only; never committed)
+/data
+
+# env (.env.example is committed; .env is not)
+.env
+.env*.local
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts

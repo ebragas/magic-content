@@ -4,7 +4,7 @@ A content-intelligence system that scrapes a creator's Instagram Reels, analyzes
 
 **Stack:** unified TypeScript (ADR-0005) — a Next.js app (dashboard + API), a TS CLI, and a shared pipeline core, all one language. SQLite via `better-sqlite3`, Apify via `apify-client`, Gemini via `@google/genai`.
 
-> **Status: design captured, not yet scaffolded.** The design is fully specified in the docs below (`CONTEXT.md`, `docs/`, `references/`). The code directories (`lib/`, `cli/`, `app/`, `config/`, `prompts/`) are the build target and don't exist yet. Start from "Build path" below.
+> **Status: v1 built (MAIN-956).** The full pipeline is implemented and green (`npx tsc --noEmit`, `npm test`, `next build`): the Content Store, `scrape`/`analyze`/`refresh`/`full` shared core, the CLI, the Next.js dashboard, the `/content-pipeline/runs` API + "Run pipeline" button, and the Claude skill. External I/O (Apify, Gemini, video download) is dependency-injected and faked at the `lib/core` seam in tests; the real adapters engage automatically from `APIFY_TOKEN` / `GEMINI_API_KEY`. The one remaining manual step is the live Definition-of-Done smoke test against `@itsmariahbrunner` (real Apify + Gemini spend) in [build-spec.md](./docs/build-spec.md).
 
 ## How it works (one breath)
 

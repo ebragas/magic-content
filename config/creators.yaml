@@ -1,0 +1,8 @@
+# Tracked Creators — the Instagram accounts whose content we model.
+# A Creator is the subject of analysis, NOT a brand we publish under (see CONTEXT.md).
+
+# How far back to scrape Reels, in days. Drives the posted_at window in `scrape`.
+scrape_window_days: 90
+
+creators:
+  - username: itsmariahbrunner

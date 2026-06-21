@@ -1,0 +1,34 @@
+# Category — our governed, sortable 7-bucket enum.
+#
+# Two classification vocabularies exist and must not be confused:
+#   - `category` (THIS file): our governed, sortable 7-bucket enum the dashboard
+#     filters on. Gemini assigns exactly one per Reel.
+#   - `content_format`: the richer enum in the framework reference §8 — an optional
+#     finer signal, part of the lean-core backlog, NOT captured in v1.
+#
+# These bucket slugs + definitions are injected into prompts/video-analysis.md at
+# render time. Editing a definition changes the rendered prompt's hash and so
+# correctly invalidates prior analysis (ADR-0003/0004). Keep slugs stable.
+
+categories:
+  - slug: tool_demo
+    name: Tool Demo
+    definition: Demonstrates a product, app, or tool in use — showing how it works or what it does.
+  - slug: concept_teaching
+    name: Concept Teaching
+    definition: Explains an idea, framework, mental model, or how-to — teaching the viewer something, not just demoing a tool.
+  - slug: story_personal
+    name: Story/Personal
+    definition: A personal narrative, experience, or slice-of-life told as a story about the creator.
+  - slug: commentary_opinion
+    name: Commentary/Opinion
+    definition: The creator's point of view, hot take, or reaction to a topic, trend, or external content.
+  - slug: promo_offer
+    name: Promo/Offer
+    definition: Promotes a product, service, offer, or sponsorship — paid or organic — with the intent to sell or capture leads.
+  - slug: news
+    name: News
+    definition: Reports or breaks down a recent event, announcement, or development in the creator's space.
+  - slug: other
+    name: Other
+    definition: Does not fit any of the above buckets; use only when no other category clearly applies.

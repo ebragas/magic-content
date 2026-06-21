@@ -1,0 +1,12 @@
+# Run guardrails + model config. Tunable without code changes (build-spec.md).
+
+# `scrape` honors this per-account result cap (like the apify/instagram-scraper source)
+# in addition to the 90-day window. Default 50.
+results_limit: 50
+
+# `analyze` processes newest-first and stops at this many NEW analyses per run.
+# Already-analyzed (unchanged-prompt-hash) Reels are skipped and don't count. Default 25.
+max_analyses_per_run: 25
+
+# Gemini model used for both transcription and video analysis.
+gemini_model: gemini-2.5-flash
