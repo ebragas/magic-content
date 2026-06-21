@@ -16,6 +16,25 @@ import type {
 
 export type RunStatus = "queued" | "running" | "succeeded" | "failed";
 
+export type RunStepStatus = "pending" | "running" | "done" | "failed";
+
+/** One stage of a run, tracked independently so the monitor page can draw a
+ *  per-stage progress bar (a `full` run has scrape → analyze → refresh). */
+export interface RunStep {
+  stage: PipelineStage;
+  status: RunStepStatus;
+  done: number;
+  total: number;
+}
+
+/** Which stages each action runs, in order — drives the initial `steps`. */
+const ACTION_STAGES: Record<PipelineAction, PipelineStage[]> = {
+  scrape: ["scrape"],
+  analyze: ["analyze"],
+  refresh: ["refresh"],
+  full: ["scrape", "analyze", "refresh"],
+};
+
 /** A run record as exposed by GET /content-pipeline/runs/{run_id}. */
 export interface RunRecord {
   run_id: string;
@@ -24,6 +43,9 @@ export interface RunRecord {
   status: RunStatus;
   stage: PipelineStage | null;
   progress: { done: number; total: number };
+  /** Per-stage progress (one entry per stage the action runs). The monitor page
+   *  draws a bar per step; the top-level stage/progress is kept for back-compat. */
+  steps: RunStep[];
   started_at: string; // ISO-8601 UTC
   finished_at: string | null; // ISO-8601 UTC, set on terminal states
   error: string | null;
@@ -98,6 +120,12 @@ export function registerRun(action: PipelineAction, creator: string | null): Run
     status: "queued",
     stage: null,
     progress: { done: 0, total: 0 },
+    steps: ACTION_STAGES[action].map((stage) => ({
+      stage,
+      status: "pending",
+      done: 0,
+      total: 0,
+    })),
     started_at: new Date().toISOString(),
     finished_at: null,
     error: null,
@@ -110,6 +138,21 @@ export function registerRun(action: PipelineAction, creator: string | null): Run
 
 export function getRun(run_id: string): RunRecord | undefined {
   return state.runs.get(run_id);
+}
+
+/** The run the monitor page should show when it doesn't know a run_id: the active
+ *  run if one is in flight, else the most-recently-started run (started_at is
+ *  ISO-8601, so lexicographic max = latest). Null when no run has ever started. */
+export function getActiveOrLatestRun(): RunRecord | null {
+  if (state.activeRunId != null) {
+    const active = state.runs.get(state.activeRunId);
+    if (active) return active;
+  }
+  let latest: RunRecord | null = null;
+  for (const r of state.runs.values()) {
+    if (!latest || r.started_at > latest.started_at) latest = r;
+  }
+  return latest;
 }
 
 /** Move a queued run to running. */
@@ -130,6 +173,23 @@ export function updateProgress(
   if (!r) return;
   r.stage = stage;
   r.progress = { done, total };
+
+  // Drive the per-step machine: the reported stage is "running", and any earlier
+  // step is implicitly "done" (the pipeline runs stages in order, so once a later
+  // stage reports progress the earlier ones have finished).
+  const idx = r.steps.findIndex((s) => s.stage === stage);
+  if (idx < 0) return;
+  for (let i = 0; i < idx; i++) {
+    const prior = r.steps[i];
+    if (prior.status !== "failed") {
+      prior.status = "done";
+      if (prior.total > 0) prior.done = prior.total;
+    }
+  }
+  const step = r.steps[idx];
+  step.status = "running";
+  step.done = done;
+  step.total = total;
 }
 
 /** Terminal success — record the PipelineResult, clear the active slot. */
@@ -139,6 +199,11 @@ export function markSucceeded(run_id: string, result: PipelineResult): void {
     r.status = "succeeded";
     r.result = result;
     r.finished_at = new Date().toISOString();
+    // All stages are done on success (clamp each bar to full where total is known).
+    for (const s of r.steps) {
+      s.status = "done";
+      if (s.total > 0) s.done = s.total;
+    }
   }
   if (state.activeRunId === run_id) state.activeRunId = null;
   evictOldTerminalRuns();
@@ -151,6 +216,10 @@ export function markFailed(run_id: string, error: unknown): void {
     r.status = "failed";
     r.error = error instanceof Error ? error.message : String(error);
     r.finished_at = new Date().toISOString();
+    // The stage that was in flight is the one that failed; leave earlier steps as-is.
+    for (const s of r.steps) {
+      if (s.status === "running") s.status = "failed";
+    }
   }
   if (state.activeRunId === run_id) state.activeRunId = null;
   evictOldTerminalRuns();
@@ -159,4 +228,10 @@ export function markFailed(run_id: string, error: unknown): void {
 function newRunId(): string {
   // crypto.randomUUID is available in the Node 18+ runtime Next uses.
   return globalThis.crypto?.randomUUID?.() ?? `run_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+/** Test seam: clear all run state so each test starts from an empty registry. */
+export function __resetForTest(): void {
+  state.runs.clear();
+  state.activeRunId = null;
 }
