@@ -18,6 +18,7 @@ import type {
   UpsertCreatorInput,
   UpsertReelInput,
 } from "./types.js";
+import { normalizeUsername } from "./username.js";
 
 export const DEFAULT_DB_PATH = "data/content.db";
 
@@ -122,7 +123,7 @@ export function openStore(path: string = DEFAULT_DB_PATH): Store {
   db.exec(SCHEMA_SQL);
 
   const upsertCreator = (input: UpsertCreatorInput): void => {
-    const username = input.username.toLowerCase().replace(/^@/, "");
+    const username = normalizeUsername(input.username);
     const stmt = db.prepare(`
       INSERT INTO creators (username, full_name, biography, is_verified, profile_url, first_seen_at, last_scraped_at)
       VALUES (@username, @full_name, @biography, @is_verified, @profile_url, @first_seen_at, @last_scraped_at)
@@ -147,11 +148,11 @@ export function openStore(path: string = DEFAULT_DB_PATH): Store {
   const getCreator = (username: string): CreatorRow | undefined => {
     return db
       .prepare(`SELECT * FROM creators WHERE username = ?`)
-      .get(username.toLowerCase().replace(/^@/, "")) as CreatorRow | undefined;
+      .get(normalizeUsername(username)) as CreatorRow | undefined;
   };
 
   const appendCreatorStats = (input: AppendCreatorStatsInput): CreatorStatsRow => {
-    const username = input.creator_username.toLowerCase().replace(/^@/, "");
+    const username = normalizeUsername(input.creator_username);
     const info = db
       .prepare(
         `INSERT INTO creator_stats (creator_username, captured_at, followers, following, posts_count)
@@ -177,7 +178,7 @@ export function openStore(path: string = DEFAULT_DB_PATH): Store {
          ORDER BY captured_at DESC, id DESC
          LIMIT 1`,
       )
-      .get(username.toLowerCase().replace(/^@/, "")) as CreatorStatsRow | undefined;
+      .get(normalizeUsername(username)) as CreatorStatsRow | undefined;
   };
 
   const listCreatorStats = (username: string): CreatorStatsRow[] => {
@@ -187,11 +188,11 @@ export function openStore(path: string = DEFAULT_DB_PATH): Store {
          WHERE creator_username = ?
          ORDER BY captured_at ASC, id ASC`,
       )
-      .all(username.toLowerCase().replace(/^@/, "")) as CreatorStatsRow[];
+      .all(normalizeUsername(username)) as CreatorStatsRow[];
   };
 
   const upsertReel = (input: UpsertReelInput): void => {
-    const creator_username = input.creator_username.toLowerCase().replace(/^@/, "");
+    const creator_username = normalizeUsername(input.creator_username);
     const top_comments =
       input.top_comments == null ? null : JSON.stringify(input.top_comments);
     const stmt = db.prepare(`
@@ -239,7 +240,7 @@ export function openStore(path: string = DEFAULT_DB_PATH): Store {
     const params: Record<string, unknown> = {};
     if (opts.creator) {
       where.push(`creator_username = @creator`);
-      params.creator = opts.creator.toLowerCase().replace(/^@/, "");
+      params.creator = normalizeUsername(opts.creator);
     }
     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
     // NULLs sort last regardless of direction (dashboard rule).

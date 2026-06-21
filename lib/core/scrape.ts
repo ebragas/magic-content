@@ -15,6 +15,7 @@ import { loadConfig } from "./config.js";
 import { rememberVideoUrl, resetVideoUrlCache } from "./analyze.js";
 import { recomputeAndPersistDerived } from "./metrics.js";
 import { monotonicNowIso } from "./store.js";
+import { normalizeUsername } from "./username.js";
 import type {
   ApifyPort,
   Deps,
@@ -114,7 +115,7 @@ function windowAndCap(
 export async function scrape(args: ScrapeArgs): Promise<ScrapeResultSummary> {
   const { creator, store } = args;
   const config = args.config ?? loadConfig();
-  const username = creator.toLowerCase().replace(/^@/, "");
+  const username = normalizeUsername(creator);
 
   const injectedApify = args.deps?.apify;
   const apify = await resolveApify(args.deps);
@@ -157,23 +158,23 @@ export async function scrape(args: ScrapeArgs): Promise<ScrapeResultSummary> {
   const resultsLimit = config.settings.results_limit;
   const now = Date.now();
 
-  // --- Pull (with a single undercount retry) ---
-  // apify/instagram-scraper occasionally returns fewer items than requested due to
-  // pagination/CDN flakiness. If the first pull comes back short of the cap AND the
-  // profile says there are more posts than we got, retry once with a bumped limit
-  // and keep whichever pull yielded more Reels. Best-effort, never throws.
+  // --- Pull (with a single cap-hit retry) ---
+  // apify/instagram-scraper truncates at `resultsLimit`, so when the first pull
+  // returns AS MANY Reels as we asked for, the cap likely clipped older Reels that
+  // still fall inside the window — retry once with a bumped limit and keep whichever
+  // pull yielded more Reels. The trigger must be a like-for-like Reel signal: we
+  // compare Reels-returned against the Reels-requested cap, NOT against the profile's
+  // posts_count (which counts ALL post types — images, carousels — so a creator who
+  // also posts photos would look perpetually "short" and fire a needless second run).
+  // Best-effort, never throws.
   let result: ScrapeResult = await apify.scrapeCreator({
     username,
     windowDays,
     resultsLimit,
   });
 
-  const postsCount = result.profile.posts_count ?? null;
-  const undercounted =
-    result.reels.length < resultsLimit &&
-    postsCount != null &&
-    result.reels.length < postsCount;
-  if (undercounted) {
+  const capHit = result.reels.length >= resultsLimit;
+  if (capHit) {
     try {
       const retry = await apify.scrapeCreator({
         username,

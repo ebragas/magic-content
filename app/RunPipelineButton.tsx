@@ -25,6 +25,11 @@ const ACTIONS: { value: Action; label: string }[] = [
 ];
 
 const POLL_INTERVAL_MS = 1500;
+// A single transient poll failure (network blip, dev-server reload) must NOT end
+// the run — the server pipeline keeps going and the run stays active. Tolerate up
+// to this many CONSECUTIVE failures, surfacing a soft "retrying" notice, before
+// giving up on the UI side.
+const MAX_POLL_FAILURES = 5;
 
 interface RunStatusResponse {
   status: RunStatus;
@@ -51,6 +56,8 @@ export function RunPipelineButton({ defaultCreator }: { defaultCreator?: string 
 
   // Track the active poll timer so we can stop it on unmount / completion.
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Count consecutive poll failures so a single transient blip doesn't abort.
+  const pollFailures = useRef(0);
 
   const stopPolling = useCallback(() => {
     if (pollTimer.current) {
@@ -65,10 +72,22 @@ export function RunPipelineButton({ defaultCreator }: { defaultCreator?: string 
     async (runId: string) => {
       try {
         const res = await fetch(`/api/content-pipeline/runs/${runId}`, { cache: "no-store" });
+        // A 404 means the registry no longer knows this run — a definitive end
+        // state, not a transient blip — so stop rather than retry forever.
+        if (res.status === 404) {
+          stopPolling();
+          pollFailures.current = 0;
+          setRunning(false);
+          setError("run not found");
+          return;
+        }
         if (!res.ok) {
           throw new Error(`status check failed (${res.status})`);
         }
         const data = (await res.json()) as RunStatusResponse;
+        // Got a real status — clear any transient-failure state.
+        pollFailures.current = 0;
+        setError(null);
         setStatus(data.status);
         setStage(data.stage);
         setProgress(data.progress ?? { done: 0, total: 0 });
@@ -88,9 +107,19 @@ export function RunPipelineButton({ defaultCreator }: { defaultCreator?: string 
         // Still running — schedule the next poll.
         pollTimer.current = setTimeout(() => void poll(runId), POLL_INTERVAL_MS);
       } catch (err) {
-        stopPolling();
-        setRunning(false);
-        setError(err instanceof Error ? err.message : String(err));
+        // Transient failure (network blip / dev-server reload). The server
+        // pipeline is still running, so keep polling instead of aborting the run.
+        pollFailures.current += 1;
+        if (pollFailures.current >= MAX_POLL_FAILURES) {
+          stopPolling();
+          pollFailures.current = 0;
+          setRunning(false);
+          setError(err instanceof Error ? err.message : String(err));
+          return;
+        }
+        // Soft notice — we're still trying. Don't clear status/progress.
+        setError("lost connection, retrying…");
+        pollTimer.current = setTimeout(() => void poll(runId), POLL_INTERVAL_MS);
       }
     },
     [router, stopPolling],
@@ -102,6 +131,7 @@ export function RunPipelineButton({ defaultCreator }: { defaultCreator?: string 
     setStatus(null);
     setStage(null);
     setProgress({ done: 0, total: 0 });
+    pollFailures.current = 0;
     setRunning(true);
     try {
       const res = await fetch("/api/content-pipeline/runs", {

@@ -278,27 +278,62 @@ describe("scrape → Content Store (fixture Apify payload)", () => {
     store.close();
   });
 
-  it("retries once on undercount and keeps the larger pull", async () => {
+  it("retries once when the cap was hit (reels == resultsLimit) and keeps the larger pull", async () => {
+    // results_limit 2: the first pull returns 2 Reels (== cap), so older in-window
+    // Reels were likely clipped → retry once with a bumped limit and keep the bigger pull.
+    const cappedConfig = structuredClone(config);
+    cappedConfig.settings.results_limit = 2;
+
     const store = openStore(":memory:");
     const calls: number[] = [];
     const big = [
-      reel({ shortcode: "p1" }),
-      reel({ shortcode: "p2" }),
-      reel({ shortcode: "p3" }),
+      reel({ shortcode: "p1", posted_at: daysAgo(1) }),
+      reel({ shortcode: "p2", posted_at: daysAgo(2) }),
+      reel({ shortcode: "p3", posted_at: daysAgo(3) }),
     ];
     const apify: ApifyPort = {
       async scrapeCreator(args) {
         calls.push(args.resultsLimit);
-        // First pull undercounts (1 of 3 posts); retry returns all 3.
+        // First pull fills the cap (2 of 3); retry (bumped limit) returns all 3.
         return calls.length === 1
-          ? { profile: { username: "c", followers: 1000, posts_count: 3 }, reels: [reel({ shortcode: "p1" })] }
+          ? {
+              profile: { username: "c", followers: 1000, posts_count: 3 },
+              reels: [reel({ shortcode: "p1", posted_at: daysAgo(1) }), reel({ shortcode: "p2", posted_at: daysAgo(2) })],
+            }
           : { profile: { username: "c", followers: 1000, posts_count: 3 }, reels: structuredClone(big) };
       },
     };
 
-    const summary = await scrape({ creator: "c", store, config, deps: { apify } });
+    const summary = await scrape({ creator: "c", store, config: cappedConfig, deps: { apify } });
     expect(calls).toHaveLength(2); // retried once
+    expect(calls[0]).toBe(2); // first pull at the cap
     expect(calls[1]).toBeGreaterThan(calls[0]); // bumped limit
+    // The retry returned 3 Reels but the cap is still 2 → keep the 2 newest.
+    expect(summary.reelsUpserted).toBe(2);
+    expect(store.listReels({ creator: "c" }).map((r) => r.shortcode).sort()).toEqual(["p1", "p2"]);
+    store.close();
+  });
+
+  it("does NOT retry for a mixed-content creator whose Reels fall short of posts_count but below the cap", async () => {
+    // A normal creator posts photos/carousels too, so posts_count (ALL post types,
+    // here 40) far exceeds the Reels returned (3). But only 3 Reels came back — well
+    // under results_limit (50) — so the cap was NOT hit and there is nothing to retry
+    // for. The buggy reels.length < posts_count signal would spuriously fire here,
+    // doubling Apify spend; the corrected cap-hit signal must NOT.
+    const store = openStore(":memory:");
+    const calls: number[] = [];
+    const apify: ApifyPort = {
+      async scrapeCreator(args) {
+        calls.push(args.resultsLimit);
+        return {
+          profile: { username: "c", followers: 1000, posts_count: 40 },
+          reels: [reel({ shortcode: "m1" }), reel({ shortcode: "m2" }), reel({ shortcode: "m3" })],
+        };
+      },
+    };
+
+    const summary = await scrape({ creator: "c", store, config, deps: { apify } });
+    expect(calls).toHaveLength(1); // single pull, no spurious retry
     expect(summary.reelsUpserted).toBe(3);
     expect(store.listReels({ creator: "c" })).toHaveLength(3);
     store.close();

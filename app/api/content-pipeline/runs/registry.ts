@@ -38,6 +38,9 @@ export interface RunRecord {
 // `const runs = new Map()` into multiple Maps, so a run registered by POST would
 // be invisible to GET (404). globalThis is the single shared object across every
 // module instance in the Node process, so the registry stays one source of truth.
+// NOTE: this only unifies module instances WITHIN one process. It does NOT cover
+// true multi-process / multi-worker deployments (e.g. clustered `next start`);
+// single-process dev/start is the supported mode (ADR-0005).
 interface RegistryState {
   runs: Map<string, RunRecord>;
   activeRunId: string | null;
@@ -48,6 +51,30 @@ const state: RegistryState = (globalScope[GLOBAL_KEY] ??= {
   runs: new Map<string, RunRecord>(),
   activeRunId: null,
 });
+
+// The Map would otherwise grow one RunRecord (each holding a full PipelineResult)
+// per run forever over a long-lived `next start` — a monotonic leak. Bound it by
+// keeping only the most recent terminal (succeeded/failed) runs; the active run is
+// never terminal, so it is never evicted, and recently finished runs stay readable
+// by GET. Runs are one-at-a-time (build-spec.md), so this cap is generous.
+const MAX_TERMINAL_RUNS = 50;
+
+function isTerminal(status: RunStatus): boolean {
+  return status === "succeeded" || status === "failed";
+}
+
+/** Drop the oldest terminal runs beyond MAX_TERMINAL_RUNS. Map iteration is
+ *  insertion order, so the first terminal ids encountered are the oldest. The
+ *  active run is queued/running (never terminal), so it is inherently kept. */
+function evictOldTerminalRuns(): void {
+  const terminalIds: string[] = [];
+  for (const [id, rec] of state.runs) {
+    if (id !== state.activeRunId && isTerminal(rec.status)) terminalIds.push(id);
+  }
+  for (let i = 0; i < terminalIds.length - MAX_TERMINAL_RUNS; i++) {
+    state.runs.delete(terminalIds[i]);
+  }
+}
 
 /** True while a run is queued or running — used by the route to reject a second
  *  POST with 409 (one run at a time is acceptable for v1, build-spec.md). */
@@ -114,6 +141,7 @@ export function markSucceeded(run_id: string, result: PipelineResult): void {
     r.finished_at = new Date().toISOString();
   }
   if (state.activeRunId === run_id) state.activeRunId = null;
+  evictOldTerminalRuns();
 }
 
 /** Terminal failure — record the error, clear the active slot. */
@@ -125,6 +153,7 @@ export function markFailed(run_id: string, error: unknown): void {
     r.finished_at = new Date().toISOString();
   }
   if (state.activeRunId === run_id) state.activeRunId = null;
+  evictOldTerminalRuns();
 }
 
 function newRunId(): string {

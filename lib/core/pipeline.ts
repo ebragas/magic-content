@@ -5,6 +5,7 @@
 import type { AppConfig } from "./config.js";
 import { loadConfig } from "./config.js";
 import { openStore, monotonicNowIso } from "./store.js";
+import { normalizeUsername } from "./username.js";
 import { analyze } from "./analyze.js";
 import { recomputeAndPersistDerived } from "./metrics.js";
 import { resolveApify, scrape } from "./scrape.js";
@@ -37,7 +38,7 @@ export interface RefreshArgs {
 export async function refresh(args: RefreshArgs): Promise<RefreshResultSummary> {
   const { creator, store } = args;
   const config = args.config ?? loadConfig();
-  const username = creator.toLowerCase().replace(/^@/, "");
+  const username = normalizeUsername(creator);
   args.onProgress?.("refresh", 0, 0);
 
   // Engage the real Apify adapter from APIFY_TOKEN when no port is injected (same
@@ -118,10 +119,9 @@ export interface PipelineArgs {
  */
 export async function pipeline(args: PipelineArgs): Promise<PipelineResult> {
   const config = args.config ?? loadConfig();
-  const creator =
-    (args.creator ?? config.creators.creators[0]?.username ?? "")
-      .toLowerCase()
-      .replace(/^@/, "");
+  const creator = normalizeUsername(
+    args.creator ?? config.creators.creators[0]?.username ?? "",
+  );
   if (!creator) {
     throw new Error("pipeline: no creator specified and none found in config");
   }

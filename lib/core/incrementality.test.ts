@@ -313,25 +313,29 @@ describe("incrementality: prompt-hash-change re-analysis (MAIN-961)", () => {
     }
   });
 
-  it("re-analysis requires a current scrape: standalone analyze with no fresh URL fails (no crash)", async () => {
+  it("re-analysis requires a current scrape: standalone analyze with no fresh URL is SKIPPED (prior success preserved, retries next run)", async () => {
     const store = openStore(":memory:");
     const payload: ScrapeResult = {
       profile: { username: "c", followers: 10_000, posts_count: 1 },
       reels: [scrapedReel({ shortcode: "R1", posted_at: daysAgo(1) })],
     };
     const { port: apify } = fakeApify(() => payload);
-    const { port: gemini } = fakeGemini();
+    const { port: gemini, transcribeCalls } = fakeGemini();
     const { port: video } = fakeVideo();
 
     // Scrape + analyze once with base config.
     await pipeline({ action: "full", creator: "c", store, config: baseConfig, deps: { apify, gemini, video } });
     expect(store.getReel("R1")!.analysis_status).toBe("analyzed");
+    const before = store.getReel("R1")!;
+    const transcribeBefore = transcribeCalls.length;
 
     // Clear the in-run cache so analyze has NO fresh Video URL (CDN URLs expire).
     resetVideoUrlCache();
 
     // Now run `analyze` standalone (NOT full) with an edited config → the Reel is a
-    // re-analysis candidate, but there is no current scrape → it fails gracefully.
+    // re-analysis candidate, but there is no current scrape. A missing Video URL must
+    // NOT mark it failed (#2): it is SKIPPED and the prior success is preserved, so it
+    // remains a re-analysis candidate that retries once a scrape provides a fresh URL.
     const edited = withEditedCategory();
     const summary = await pipeline({
       action: "analyze",
@@ -340,11 +344,87 @@ describe("incrementality: prompt-hash-change re-analysis (MAIN-961)", () => {
       config: edited,
       deps: { gemini, video },
     });
+    expect(summary.analyze!.failed).toBe(0); // a missing URL is never a failure
+    expect(summary.analyze!.analyzed).toBe(0);
+    expect(summary.analyze!.skipped).toBe(1); // counted as skipped, not failed
+
+    const r1 = store.getReel("R1")!;
+    // Prior success is intact: status, analysis fields, and the (now-drifted) hash —
+    // so it stays a re-analysis candidate. No Gemini work was attempted.
+    expect(r1.analysis_status).toBe("analyzed");
+    expect(r1.transcript).toBe(before.transcript);
+    expect(r1.analysis_prompt_hash).toBe(before.analysis_prompt_hash);
+    expect(r1.analyzed_at).toBe(before.analyzed_at);
+    expect(transcribeCalls.length).toBe(transcribeBefore);
+
+    store.close();
+  });
+
+  it("a FAILED re-analysis preserves the prior success (no red badge, hashes un-advanced) and retries next run (#5)", async () => {
+    const store = openStore(":memory:");
+    const payload: ScrapeResult = {
+      profile: { username: "c", followers: 10_000, posts_count: 1 },
+      reels: [scrapedReel({ shortcode: "R1", posted_at: daysAgo(1) })],
+    };
+    const { port: apify } = fakeApify(() => payload);
+
+    // Run 1: a clean Gemini analyzes R1 successfully (base config).
+    const ok = fakeGemini();
+    await pipeline({ action: "full", creator: "c", store, config: baseConfig, deps: { apify, gemini: ok.port, video: fakeVideo().port } });
+    const before = store.getReel("R1")!;
+    expect(before.analysis_status).toBe("analyzed");
+    expect(before.transcript).toBe("verbatim spoken words");
+
+    // Run 2: edited config makes R1 a re-analysis candidate, but the analysis call now
+    // throws (e.g. transient Gemini error). The prior success must NOT be destroyed.
+    const edited = withEditedCategory();
+    const editedAnalysisHash = analysisPromptHash(edited);
+    const boomGemini: GeminiPort = {
+      async transcribe() {
+        return { transcript: "fresh transcript that must NOT be persisted" };
+      },
+      async analyzeVideo() {
+        throw new Error("gemini analyze boom");
+      },
+    };
+    const summary = await pipeline({
+      action: "full",
+      creator: "c",
+      store,
+      config: edited,
+      deps: { apify, gemini: boomGemini, video: fakeVideo().port },
+    });
     expect(summary.analyze!.failed).toBe(1);
     expect(summary.analyze!.analyzed).toBe(0);
-    const r1 = store.getReel("R1")!;
-    expect(r1.analysis_status).toBe("failed");
-    expect(r1.analysis_error).toContain("fresh scrape");
+
+    const after = store.getReel("R1")!;
+    // Prior success preserved verbatim — NOT a green analysis wearing a red badge.
+    expect(after.analysis_status).toBe("analyzed");
+    expect(after.transcript).toBe(before.transcript);
+    expect(after.category).toBe(before.category);
+    expect(after.why_it_works).toBe(before.why_it_works);
+    expect(after.beat_sequence).toBe(before.beat_sequence);
+    expect(after.analyzed_at).toBe(before.analyzed_at);
+    // Hashes NOT advanced → still drifted from the edited hash → remains a candidate.
+    expect(after.analysis_prompt_hash).toBe(before.analysis_prompt_hash);
+    expect(after.analysis_prompt_hash).not.toBe(editedAnalysisHash);
+    // The error is recorded without claiming a new success.
+    expect(after.analysis_error).toContain("boom");
+
+    // Run 3: with a healthy Gemini, the still-drifted Reel re-analyzes and re-stamps.
+    const healed = fakeGemini();
+    const third = await pipeline({
+      action: "full",
+      creator: "c",
+      store,
+      config: edited,
+      deps: { apify, gemini: healed.port, video: fakeVideo().port },
+    });
+    expect(third.analyze!.analyzed).toBe(1); // it retried and succeeded
+    const final = store.getReel("R1")!;
+    expect(final.analysis_status).toBe("analyzed");
+    expect(final.analysis_prompt_hash).toBe(editedAnalysisHash);
+    expect(final.analysis_error).toBeNull();
 
     store.close();
   });

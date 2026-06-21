@@ -16,6 +16,7 @@
 // + Video adapters auto-engage inside analyze() when GEMINI_API_KEY is set.
 
 import { pipeline } from "../../../../lib/core/pipeline.js";
+import { normalizeUsername } from "../../../../lib/core/username.js";
 import type { PipelineAction } from "../../../../lib/core/types.js";
 import {
   isRunActive,
@@ -61,7 +62,12 @@ export async function POST(request: Request): Promise<Response> {
   if (body.creator != null && typeof body.creator !== "string") {
     return Response.json({ error: "creator must be a string" }, { status: 400 });
   }
-  const creator = (body.creator as string | undefined)?.trim() || undefined;
+  // Canonicalize to the store key (normalizeUsername: lowercase + strip a leading
+  // '@') so the echoed RunRecord.creator and the GET status payload match the key
+  // pipeline/scrape/analyze write under — not the raw '@ItsMariahBrunner' a user
+  // typed (#8). Map an empty/'@'-only handle to undefined (let pipeline default it).
+  const rawCreator = (body.creator as string | undefined)?.trim();
+  const creator = rawCreator ? normalizeUsername(rawCreator) || undefined : undefined;
 
   // One run at a time (build-spec.md). Reject a concurrent POST with 409. The
   // upfront check is the fast path; registerRun() re-checks and throws, so we wrap

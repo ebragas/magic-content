@@ -168,4 +168,38 @@ describe("Content Store schema round-trip", () => {
     expect(reels.map((r) => r.shortcode)).toEqual(["new", "old", "noDate"]);
     store.close();
   });
+
+  it("listReels sorts category ascending (alphabetical, NULLs last)", () => {
+    // The dashboard's Category sort drives direction='asc' so categories read
+    // naturally (alphabetical), NOT reverse-alphabetically. NULL categories still
+    // sort last regardless of direction.
+    const store = openStore(":memory:");
+    store.upsertCreator({ username: "c" });
+    store.upsertReel({ shortcode: "tool", url: "u1", creator_username: "c" });
+    store.upsertReel({ shortcode: "promo", url: "u2", creator_username: "c" });
+    store.upsertReel({ shortcode: "story", url: "u3", creator_username: "c" });
+    store.upsertReel({ shortcode: "none", url: "u4", creator_username: "c" });
+    store.updateReelAnalysis({ shortcode: "tool", category: "tool_demo" });
+    store.updateReelAnalysis({ shortcode: "promo", category: "promo_offer" });
+    store.updateReelAnalysis({ shortcode: "story", category: "story_personal" });
+    // "none" left with a NULL category.
+
+    const asc = store.listReels({ creator: "c", orderBy: "category", direction: "asc" });
+    expect(asc.map((r) => r.category)).toEqual([
+      "promo_offer",
+      "story_personal",
+      "tool_demo",
+      null, // NULL sorts last even ascending
+    ]);
+
+    // DESC reverses the non-null order but still keeps NULLs last.
+    const desc = store.listReels({ creator: "c", orderBy: "category", direction: "desc" });
+    expect(desc.map((r) => r.category)).toEqual([
+      "tool_demo",
+      "story_personal",
+      "promo_offer",
+      null,
+    ]);
+    store.close();
+  });
 });
