@@ -1,0 +1,213 @@
+/* ═══════════════════════════════════════════════════════════════════
+   Magic Content — design-system foundations.
+
+   Color & type tokens are the Magic & Co "Agentic Operating System" set
+   (sand palette, orange accent, dual light/dark), imported from the
+   claude.ai/design project "Magic Content" (colors_and_type.css). The brand
+   families (DM Sans / Instrument Serif / JetBrains Mono) are loaded via
+   next/font in app/layout.tsx, which exposes them as the CSS variables
+   wired into --font-sans/serif/mono below.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ═══ Light mode (default) ═══ */
+:root,
+[data-theme="light"] {
+  /* Backgrounds — sand palette */
+  --bg: #f0eee6;
+  --bg-deep: #dbd5c9;
+  --bg-elevated: #ffffff;
+  --bg-surface: #ffffff;
+
+  /* Foreground */
+  --fg: #1b1a18;
+  --fg-muted: #6b6660;
+  --fg-faint: #8a8580;
+
+  /* Borders */
+  --border: #c9c2b5;
+  --border-faint: #dddbd4;
+
+  /* Surfaces */
+  --card: #ffffff;
+  --glass: #e8e5de;
+  --glass-border: #dddbd4;
+  --glass-heavy: #dddbd4;
+
+  /* Semantic status */
+  --success: #dfe6e1;
+  --success-fg: #6e8a58;
+  --error: #e5dcd9;
+  --error-fg: #a0606f;
+  --warning: #f0e8dc;
+  --warning-fg: #d4551f;
+  --info: #dbd5c9;
+  --info-fg: #6b6b6b;
+}
+
+/* ═══ Dark mode ═══ */
+[data-theme="dark"] {
+  --bg: #1b1a18;
+  --bg-deep: #131210;
+  --bg-elevated: #2d2b27;
+  --bg-surface: #393732;
+
+  --fg: #ffffff;
+  --fg-muted: #a8a29c;
+  --fg-faint: #706b65;
+
+  --border: #4a4743;
+  --border-faint: #2d2c2a;
+
+  --card: #2d2b27;
+  --glass: #242321;
+  --glass-border: #2d2c2a;
+  --glass-heavy: #2d2c2a;
+
+  --success: #1a2e14;
+  --success-fg: #8ba870;
+  --error: #2e1a22;
+  --error-fg: #c4788a;
+  --warning: #2e2010;
+  --warning-fg: #e8622a;
+  --info: #2d2b27;
+  --info-fg: #8a8a8a;
+}
+
+/* ═══ Theme-independent tokens ═══ */
+:root {
+  /* Accent — identical in both modes */
+  --accent: #e8622a;
+  --accent-hover: #d4551f;
+  --accent-glow-light: #efddcf;
+  --accent-glow-dark: #34231a;
+
+  /* Sand scale */
+  --sand: #f0eee6;
+  --sand-dark: #e2ddd2;
+  --sand-mid: #dbd5c9;
+  --sand-deep: #c9c2b5;
+
+  /* Secondary hues */
+  --sage: #8ba870;
+  --sage-muted: #6e8a58;
+  --rose: #c4788a;
+  --rose-muted: #a0606f;
+
+  /* Grays */
+  --gray: #6b6660;
+  --gray-light: #8a8580;
+  --gray-faint: #4a4743;
+
+  /* Typography — families come from next/font (app/layout.tsx). */
+  --font-sans: var(--font-dm-sans), -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: var(--font-dm-sans), -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-serif: var(--font-instrument-serif), Georgia, serif;
+  --font-mono: var(--font-jetbrains-mono), "SF Mono", ui-monospace, monospace;
+
+  /* Radius (tight by design — most UI is 2px) */
+  --radius-none: 0px;
+  --radius-xs: 2px;
+  --radius-sm: 8px;
+  --radius-md: 16px;
+  --radius-lg: 20px;
+  --radius-pill: 999px;
+
+  /* Shadows */
+  --shadow-glass: 0 8px 40px rgba(0, 0, 0, 0.12);
+  --shadow-elevated: 0 4px 24px rgba(0, 0, 0, 0.08);
+
+  /* Motion */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 200ms;
+  --duration-base: 300ms;
+}
+
+/* ═══ Base reset ═══ */
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+input,
+textarea,
+button,
+select {
+  font-family: inherit;
+}
+textarea {
+  resize: vertical;
+}
+a {
+  color: inherit;
+}
+
+/* ═══ Scrollbar ═══ */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ═══ Keyframes ═══ */
+@keyframes mc-indet {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(440%);
+  }
+}
+@keyframes mc-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.mc-up {
+  animation: mc-up 0.4s var(--ease-standard) both;
+}
+
+/* ═══ Hover helpers (inline styles can't express :hover) ═══ */
+.mc-row {
+  transition: background var(--duration-fast);
+}
+.mc-row:hover {
+  background: var(--glass);
+}
+.mc-card {
+  transition:
+    box-shadow 150ms,
+    transform 150ms;
+}
+.mc-card:hover {
+  box-shadow: var(--shadow-elevated);
+  transform: translateY(-2px);
+}
+.mc-press {
+  transition: filter 120ms;
+}
+.mc-press:hover {
+  filter: brightness(0.96);
+}

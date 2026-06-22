@@ -14,10 +14,22 @@
 import { openStore } from "../lib/core/store.js";
 import { loadConfig } from "../lib/core/config.js";
 import type {
+  CreatorStatsRow,
   ReelRow,
   Store,
   ListReelsOptions,
 } from "../lib/core/types.js";
+import {
+  decodeBeats,
+  decodeComments,
+  hookDescription,
+  hookLabel,
+  initials,
+  splitWhy,
+  titleCase,
+  type BeatVM,
+  type CommentVM,
+} from "./content-labels.js";
 
 /**
  * Dashboard sort axes (build-spec.md DoD #4: "sorts by performance / category /
@@ -161,6 +173,240 @@ export function getDashboardData(
     });
 
     return { rows, total: rows.length, sort, viralOnly, category, categoriesPresent, categoryNames };
+  } finally {
+    if (ownsStore) s.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// App shell view-model (the redesigned dashboard).
+//
+// The redesigned UI is a single client shell (AppShell) that switches between
+// Library / Creators / Runs / Detail views and filters/sorts in the browser. To
+// keep that snappy without a fan-out of API routes, the server loads the WHOLE
+// (small, last-90-day) dataset once per request and hands the client plain,
+// serializable view-models. All DB access stays here (server-side, ADR-0002).
+// ---------------------------------------------------------------------------
+
+/** One Reel as the redesigned UI consumes it — plain data, safe to serialize to the client. */
+export interface ReelVM {
+  shortcode: string;
+  url: string;
+  /** Streaming thumbnail route; the <img>/background degrades if it 404s. */
+  thumbUrl: string;
+  handle: string; // creator_username
+  creatorName: string;
+  creatorInitials: string;
+  topic: string | null;
+  caption: string | null;
+  categorySlug: string | null;
+  categoryLabel: string | null;
+  hookSlug: string | null;
+  hookLabel: string;
+  hookDescription: string;
+  viral: boolean; // is_viral === 1 (NULL/0 → false)
+  outlier: boolean; // is_outlier === 1
+  views: number | null;
+  likes: number | null;
+  comments: number | null;
+  performance: number | null;
+  engagementRate: number | null;
+  followers: number | null; // creator followers at latest snapshot
+  durationSec: number | null;
+  postedAt: string | null; // ISO-8601 UTC; client sorts "Newest" on this
+  analysisStatus: string | null;
+  beats: BeatVM[];
+  transcript: string | null;
+  /** First sentence of why_it_works, as a serif pull-quote. */
+  whyPull: string;
+  /** Remainder of why_it_works (may be empty). */
+  why: string;
+  /** Top comments (questions first), for the detail "Questions from comments" block. */
+  topComments: CommentVM[];
+}
+
+/** One tracked Creator as the Creators view consumes it. */
+export interface CreatorVM {
+  handle: string;
+  name: string;
+  initials: string;
+  verified: boolean;
+  bio: string | null;
+  followers: number | null;
+  /** Follower delta over ~30 days from creator_stats; NULL when history is too thin. */
+  growth: number | null;
+  analyzed: number; // Reels with analysis_status === 'analyzed'
+  outliers: number;
+  reelCount: number;
+  /** Up to 3 best-performing Reels, for the card's thumbnails. */
+  top: { shortcode: string; thumbUrl: string; topic: string | null; performance: number | null }[];
+}
+
+export interface AppData {
+  reels: ReelVM[];
+  creators: CreatorVM[];
+  /** Category slugs present, with display label and Reel count — drives the chips. */
+  categoriesPresent: { slug: string; label: string; count: number }[];
+  reelCount: number;
+  creatorCount: number;
+}
+
+/** Follower growth over ~30 days from a creator's snapshot history (NULL if too thin). */
+function followerGrowth(stats: CreatorStatsRow[]): number | null {
+  if (stats.length < 2) return null;
+  const latest = stats[stats.length - 1];
+  if (latest.followers == null) return null;
+  const latestMs = Date.parse(latest.captured_at);
+  const targetMs = latestMs - 30 * 24 * 60 * 60 * 1000;
+  // Snapshot whose capture time is closest to 30 days before the latest one.
+  let best: CreatorStatsRow | null = null;
+  let bestDist = Infinity;
+  for (const s of stats) {
+    if (s === latest || s.followers == null) continue;
+    const dist = Math.abs(Date.parse(s.captured_at) - targetMs);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = s;
+    }
+  }
+  if (!best || best.followers == null) return null;
+  return latest.followers - best.followers;
+}
+
+/**
+ * Read the WHOLE Content Store and assemble the redesigned UI's view-model: every
+ * Reel (newest-first), every tracked Creator with aggregates, and the Category
+ * chips. Opens its own store handle (injectable for tests/seed harnesses) and
+ * always closes it. Safe against an empty store — returns empty arrays, never throws.
+ */
+export function getAppData(store?: Store): AppData {
+  const ownsStore = store == null;
+  const s = store ?? openStore();
+  try {
+    const reels = s.listReels({ orderBy: "posted_at", direction: "desc" });
+
+    // Authored slug → display name from config/categories.yaml (the prompt's source
+    // of truth). Labels resolve here; title-case is only a defensive fallback.
+    const categoryNames: Record<string, string> = {};
+    for (const c of loadConfig().categories.categories) categoryNames[c.slug] = c.name;
+    const catLabel = (slug: string | null): string | null =>
+      slug == null ? null : (categoryNames[slug] ?? titleCase(slug));
+
+    // Per-creator caches (followers + display name) so we don't re-query per Reel.
+    const followersCache = new Map<string, number | null>();
+    const nameCache = new Map<string, string>();
+    const resolveCreator = (username: string) => {
+      if (!nameCache.has(username)) {
+        const creator = s.getCreator(username);
+        nameCache.set(username, creator?.full_name?.trim() || username);
+      }
+      if (!followersCache.has(username)) {
+        followersCache.set(username, s.getLatestStats(username)?.followers ?? null);
+      }
+      return {
+        name: nameCache.get(username) ?? username,
+        followers: followersCache.get(username) ?? null,
+      };
+    };
+
+    const reelVMs: ReelVM[] = reels.map((reel) => {
+      const { name, followers } = resolveCreator(reel.creator_username);
+      const { pull, body } = splitWhy(reel.why_it_works);
+      return {
+        shortcode: reel.shortcode,
+        url: reel.url,
+        thumbUrl: `/api/thumbnails/${reel.shortcode}`,
+        handle: reel.creator_username,
+        creatorName: name,
+        creatorInitials: initials(name),
+        topic: reel.topic,
+        caption: reel.caption,
+        categorySlug: reel.category,
+        categoryLabel: catLabel(reel.category),
+        hookSlug: reel.hook_technique,
+        hookLabel: hookLabel(reel.hook_technique),
+        hookDescription: hookDescription(reel.hook_technique),
+        viral: reel.is_viral === 1,
+        outlier: reel.is_outlier === 1,
+        views: reel.views,
+        likes: reel.likes,
+        comments: reel.comments_count,
+        performance: reel.performance_score,
+        engagementRate: reel.engagement_rate,
+        followers,
+        durationSec: reel.duration_sec,
+        postedAt: reel.posted_at,
+        analysisStatus: reel.analysis_status,
+        beats: decodeBeats(reel.beat_sequence),
+        transcript: reel.transcript,
+        whyPull: pull,
+        why: body,
+        topComments: decodeComments(reel.top_comments, {
+          caption: reel.caption,
+          creatorUsername: reel.creator_username,
+        }),
+      };
+    });
+
+    // Distinct creators present (in Reel order: newest activity first), with aggregates.
+    const creatorVMs: CreatorVM[] = [];
+    const seen = new Set<string>();
+    for (const reel of reels) {
+      const username = reel.creator_username;
+      if (seen.has(username)) continue;
+      seen.add(username);
+      const creator = s.getCreator(username);
+      const { name, followers } = resolveCreator(username);
+      const mine = reelVMs.filter((r) => r.handle === username);
+      const top = mine
+        .slice()
+        .sort((a, b) => (b.performance ?? -Infinity) - (a.performance ?? -Infinity))
+        .slice(0, 3)
+        .map((r) => ({
+          shortcode: r.shortcode,
+          thumbUrl: r.thumbUrl,
+          topic: r.topic,
+          performance: r.performance,
+        }));
+      creatorVMs.push({
+        handle: username,
+        name,
+        initials: initials(name),
+        verified: creator?.is_verified === 1,
+        bio: creator?.biography ?? null,
+        followers,
+        growth: followerGrowth(s.listCreatorStats(username)),
+        analyzed: mine.filter((r) => r.analysisStatus === "analyzed").length,
+        outliers: mine.filter((r) => r.outlier).length,
+        reelCount: mine.length,
+        top,
+      });
+    }
+
+    // Category chips: slugs present, with counts, ordered by config then alphabetical.
+    const counts = new Map<string, number>();
+    for (const r of reelVMs) {
+      if (r.categorySlug) counts.set(r.categorySlug, (counts.get(r.categorySlug) ?? 0) + 1);
+    }
+    const configOrder = loadConfig().categories.categories.map((c) => c.slug);
+    const categoriesPresent = Array.from(counts.keys())
+      .sort((a, b) => {
+        const ia = configOrder.indexOf(a);
+        const ib = configOrder.indexOf(b);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.localeCompare(b);
+      })
+      .map((slug) => ({ slug, label: catLabel(slug) ?? slug, count: counts.get(slug)! }));
+
+    return {
+      reels: reelVMs,
+      creators: creatorVMs,
+      categoriesPresent,
+      reelCount: reelVMs.length,
+      creatorCount: creatorVMs.length,
+    };
   } finally {
     if (ownsStore) s.close();
   }
