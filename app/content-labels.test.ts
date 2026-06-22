@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeComments, extractManychatKeywords, normalizeCommentText } from "./content-labels.js";
+import { decodeBeats, decodeComments, extractManychatKeywords, normalizeCommentText } from "./content-labels.js";
 
 const json = (comments: { username: string; text: string; likes?: number }[]) =>
   JSON.stringify(comments.map((c) => ({ likes: 0, ...c })));
@@ -114,5 +114,37 @@ describe("decodeComments — ManyChat filtering", () => {
       "saving this for later", // then by likes desc
       "This is so helpful, thank you!",
     ]);
+  });
+});
+
+describe("decodeBeats", () => {
+  it("carries each beat's verbatim text through to the view-model", () => {
+    const beats = decodeBeats(
+      JSON.stringify([
+        { label: "HOOK", start_pct: 0, end_pct: 10, text: "Claude just announced something." },
+        { label: "CTA", start_pct: 90, end_pct: 100, text: "Follow for more." },
+      ]),
+    );
+    expect(beats.map((b) => b.text)).toEqual([
+      "Claude just announced something.",
+      "Follow for more.",
+    ]);
+    // The rest of the VM enrichment still resolves.
+    expect(beats[0].label).toBe("HOOK");
+    expect(beats[0].note).toBe("Attention capture");
+  });
+
+  it("defaults text to '' for rows analyzed before per-beat text existed", () => {
+    const beats = decodeBeats(
+      JSON.stringify([{ label: "VALUE_1", start_pct: 10, end_pct: 60 }]),
+    );
+    expect(beats).toHaveLength(1);
+    expect(beats[0].text).toBe("");
+  });
+
+  it("returns [] for null / non-JSON / non-array input", () => {
+    expect(decodeBeats(null)).toEqual([]);
+    expect(decodeBeats("not json")).toEqual([]);
+    expect(decodeBeats("{}")).toEqual([]);
   });
 });

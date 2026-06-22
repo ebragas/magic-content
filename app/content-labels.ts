@@ -151,6 +151,8 @@ export interface BeatVM {
   end: number;
   note: string;
   color: string;
+  /** Verbatim transcript spoken during this beat; "" for speechless or pre-backfill rows. */
+  text: string;
 }
 
 /** Decode the beat_sequence JSON column → enriched beat VMs. Bad/empty JSON → []. */
@@ -172,6 +174,8 @@ export function decodeBeats(json: string | null): BeatVM[] {
       end: b.end_pct ?? 0,
       note: BEAT_NOTES[b.label] ?? "",
       color: BEAT_COLORS[b.label] ?? "var(--fg-faint)",
+      // Rows analyzed before per-beat text was added have no `text` key → "".
+      text: typeof b.text === "string" ? b.text : "",
     }));
 }
 

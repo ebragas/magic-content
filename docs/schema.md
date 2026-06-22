@@ -90,21 +90,21 @@ Derived metrics are recomputed every refresh from the Reel's metrics and the cre
 
 ## JSON shapes
 
-### `beat_sequence` (beats carry approximate timing)
+### `beat_sequence` (beats carry approximate timing + their verbatim transcript slice)
 
-Ordered array; each beat is a label from the framework beat vocabulary plus approximate position as a percentage of total duration:
+Ordered array; each beat is a label from the framework beat vocabulary, its approximate position as a percentage of total duration, and `text` — the verbatim transcript words spoken during that beat:
 
 ```json
 [
-  { "label": "HOOK",    "start_pct": 0,  "end_pct": 8 },
-  { "label": "CONTEXT", "start_pct": 8,  "end_pct": 20 },
-  { "label": "VALUE_1", "start_pct": 20, "end_pct": 55 },
-  { "label": "PAYOFF",  "start_pct": 55, "end_pct": 85 },
-  { "label": "CTA",     "start_pct": 85, "end_pct": 100 }
+  { "label": "HOOK",    "start_pct": 0,  "end_pct": 8,   "text": "Claude just announced something I'm genuinely so excited about." },
+  { "label": "CONTEXT", "start_pct": 8,  "end_pct": 20,  "text": "Artifacts are now available in Claude Code, which means…" },
+  { "label": "VALUE_1", "start_pct": 20, "end_pct": 55,  "text": "…" },
+  { "label": "PAYOFF",  "start_pct": 55, "end_pct": 85,  "text": "…" },
+  { "label": "CTA",     "start_pct": 85, "end_pct": 100, "text": "Follow for more." }
 ]
 ```
 
-Labels: `HOOK, CONTEXT, VALUE_1, VALUE_2, VALUE_3, TENSION, PAYOFF, ESCALATION, CTA, LOOP_BRIDGE` (see `references/content-strategy-framework.md` §2). `start_pct`/`end_pct` are Gemini's approximate estimates.
+Labels: `HOOK, CONTEXT, VALUE_1, VALUE_2, VALUE_3, TENSION, PAYOFF, ESCALATION, CTA, LOOP_BRIDGE` (see `references/content-strategy-framework.md` §2). `start_pct`/`end_pct` are Gemini's approximate estimates. `text` is the transcript segmented along beat boundaries — best-effort (`""` for a speechless beat); the flat `reels.transcript` column stays canonical and is **not** reconstructed from these slices. Beats stored before `text` was added simply lack the key (decoded as `""`) until a prompt-hash re-analysis backfills them.
 
 ### `top_comments`
 

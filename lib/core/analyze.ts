@@ -176,6 +176,10 @@ function sanitizeBeats(beats: Beat[] | undefined | null): Beat[] {
       label: b.label,
       start_pct: clamp(b.start_pct),
       end_pct: clamp(b.end_pct),
+      // Carry the per-beat verbatim transcript slice through; default "" when the
+      // model omits it (older prompt) or returns a non-string. The flat transcript
+      // stays canonical, so we trim edges but never validate/reconstruct from these.
+      text: typeof b.text === "string" ? b.text.trim() : "",
     }));
 }
 
