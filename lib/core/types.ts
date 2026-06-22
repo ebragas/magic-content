@@ -41,6 +41,13 @@ export interface Beat {
   label: BeatLabel;
   start_pct: number;
   end_pct: number;
+  /**
+   * Verbatim transcript words spoken during this beat (the transcript segmented
+   * along beat boundaries). `""` for a speechless beat (e.g. a visual-only HOOK or
+   * a silent LOOP_BRIDGE). Best-effort: the flat `reels.transcript` stays canonical
+   * and is NOT reconstructed from these slices.
+   */
+  text: string;
 }
 
 export type BeatLabel =

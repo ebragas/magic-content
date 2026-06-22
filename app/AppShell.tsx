@@ -930,15 +930,26 @@ function DetailView({
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", marginTop: 14 }}>
                   {reel.beats.map((b, i) => (
-                    <div key={`${b.label}-${i}`} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 0", borderTop: "1px solid var(--border-faint)" }}>
-                      <span style={{ width: 9, height: 9, borderRadius: 2, flex: "none", background: b.color }} />
+                    <div key={`${b.label}-${i}`} style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "11px 0", borderTop: "1px solid var(--border-faint)" }}>
+                      <span style={{ width: 9, height: 9, borderRadius: 2, flex: "none", background: b.color, marginTop: 5 }} />
                       <div style={{ flex: "none", width: 120 }}>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, letterSpacing: "0.06em" }}>{b.label}</div>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-faint)", marginTop: 3 }}>
                           {b.start}–{b.end}%
                         </div>
                       </div>
-                      <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: "var(--fg-muted)" }}>{b.note}</div>
+                      {/* Verbatim transcript for this beat when present (the per-beat
+                          segmentation); the generic "what this beat does" note drops to a
+                          faint super-label. Pre-backfill / speechless beats fall back to
+                          just the note — exactly today's view. */}
+                      {b.text.trim() ? (
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 11, color: "var(--fg-faint)", marginBottom: 4 }}>{b.note}</div>
+                          <div style={{ fontSize: 13.5, color: "var(--fg)", lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{b.text}</div>
+                        </div>
+                      ) : (
+                        <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: "var(--fg-muted)" }}>{b.note}</div>
+                      )}
                     </div>
                   ))}
                 </div>

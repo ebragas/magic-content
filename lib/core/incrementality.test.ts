@@ -51,10 +51,10 @@ function daysAgo(n: number): string {
 }
 
 const BEATS: Beat[] = [
-  { label: "HOOK", start_pct: 0, end_pct: 10 },
-  { label: "VALUE_1", start_pct: 10, end_pct: 60 },
-  { label: "PAYOFF", start_pct: 60, end_pct: 90 },
-  { label: "CTA", start_pct: 90, end_pct: 100 },
+  { label: "HOOK", start_pct: 0, end_pct: 10, text: "Here's the hook." },
+  { label: "VALUE_1", start_pct: 10, end_pct: 60, text: "Here's the first value beat." },
+  { label: "PAYOFF", start_pct: 60, end_pct: 90, text: "Here's the payoff." },
+  { label: "CTA", start_pct: 90, end_pct: 100, text: "Follow for more." },
 ];
 
 function analysisResult(overrides: Partial<GeminiAnalysisResult> = {}): GeminiAnalysisResult {

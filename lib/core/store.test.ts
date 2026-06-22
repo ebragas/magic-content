@@ -128,9 +128,9 @@ describe("Content Store schema round-trip", () => {
       category: "tool_demo",
       hook_technique: "curiosity_gap",
       beat_sequence: [
-        { label: "HOOK", start_pct: 0, end_pct: 8 },
-        { label: "VALUE_1", start_pct: 8, end_pct: 80 },
-        { label: "CTA", start_pct: 80, end_pct: 100 },
+        { label: "HOOK", start_pct: 0, end_pct: 8, text: "hey here is" },
+        { label: "VALUE_1", start_pct: 8, end_pct: 80, text: "how I triage email" },
+        { label: "CTA", start_pct: 80, end_pct: 100, text: "" },
       ],
       why_it_works: "Specific, fast payoff.",
       analysis_status: "analyzed",

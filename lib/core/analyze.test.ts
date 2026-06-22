@@ -30,10 +30,10 @@ function daysAgo(n: number): string {
 }
 
 const BEATS: Beat[] = [
-  { label: "HOOK", start_pct: 0, end_pct: 10 },
-  { label: "VALUE_1", start_pct: 10, end_pct: 60 },
-  { label: "PAYOFF", start_pct: 60, end_pct: 90 },
-  { label: "CTA", start_pct: 90, end_pct: 100 },
+  { label: "HOOK", start_pct: 0, end_pct: 10, text: "Claude just announced something I'm genuinely so excited about." },
+  { label: "VALUE_1", start_pct: 10, end_pct: 60, text: "You can now turn anything into a live, interactive website." },
+  { label: "PAYOFF", start_pct: 60, end_pct: 90, text: "And it just works, right inside the editor." },
+  { label: "CTA", start_pct: 90, end_pct: 100, text: "Follow for more Claude tips." },
 ];
 
 function analysisResult(overrides: Partial<GeminiAnalysisResult> = {}): GeminiAnalysisResult {
@@ -305,6 +305,8 @@ describe("analyze → Content Store (faked Gemini + Video)", () => {
 
     const beats = JSON.parse(store.getReel("beats")!.beat_sequence!) as Beat[];
     expect(beats.map((b) => b.label)).toEqual(["HOOK", "PAYOFF"]);
+    // Source beats carried no `text`; sanitizeBeats defaults each to "".
+    expect(beats.map((b) => b.text)).toEqual(["", ""]);
 
     store.close();
   });

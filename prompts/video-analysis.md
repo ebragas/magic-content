@@ -9,7 +9,7 @@ Return ONLY a single JSON object (no markdown fences, no commentary) with EXACTL
   "category": "string — EXACTLY ONE slug from the Category list below",
   "hook_technique": "string — EXACTLY ONE slug from the Hook Technique list below, describing the opening 1–3 seconds",
   "beat_sequence": [
-    { "label": "string — one beat label from the Beat Vocabulary below", "start_pct": 0, "end_pct": 8 }
+    { "label": "string — one beat label from the Beat Vocabulary below", "start_pct": 0, "end_pct": 8, "text": "string — the verbatim transcript words spoken during this beat (\"\" if the beat has no speech)" }
   ],
   "why_it_works": "string — 2–3 sentences on why this Reel does or doesn't earn attention and retention, grounded in the hook and beats."
 }
@@ -39,6 +39,8 @@ Return ONLY a single JSON object (no markdown fences, no commentary) with EXACTL
 ## Beat Vocabulary — ordered, with approximate timing (framework §2)
 
 `beat_sequence` is an ordered array. Each beat has a `label` from this vocabulary plus `start_pct` and `end_pct` — your approximate estimate of where the beat falls as a percentage (0–100) of total duration. Beats should be contiguous and cover the video in order.
+
+Each beat also carries a `text` field: the exact, verbatim substring of the transcript spoken during that beat. Assign **every word of the transcript to exactly one beat, in order**, so that concatenating all beats' `text` in sequence reproduces the full transcript — no words added, dropped, paraphrased, re-punctuated, or reordered. Copy the words verbatim from the transcript you were given. For a beat with no spoken words (e.g. a visual-only `HOOK` or a silent `LOOP_BRIDGE`), set `text` to an empty string `""`. If the transcript uses speaker labels like `Speaker 1:`, keep them attached to the words of the beat in which they occur.
 
 - `HOOK` — The attention-capture moment (typically 0–10%).
 - `CONTEXT` — Brief setup: who this is for, what problem/situation it addresses.
