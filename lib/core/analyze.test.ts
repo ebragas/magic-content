@@ -6,7 +6,7 @@
 // Apify/Gemini network calls. A fixture Gemini response drives each case.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { analysisPromptHash, loadConfig, transcriptionPromptHash } from "./config.js";
+import { analysisPromptHash, applyNoCap, loadConfig, transcriptionPromptHash } from "./config.js";
 import { openStore } from "./store.js";
 import { analyze, __setVideoUrlForTest, resetVideoUrlCache } from "./analyze.js";
 import { pipeline } from "./pipeline.js";
@@ -16,6 +16,7 @@ import type {
   GeminiAnalysisResult,
   GeminiPort,
   ScrapeResult,
+  ScrapedComment,
   ScrapedReel,
   Store,
   VideoPort,
@@ -184,6 +185,32 @@ describe("analyze → Content Store (faked Gemini + Video)", () => {
     expect([analyzed("n0"), analyzed("n1"), analyzed("n2")]).toEqual([true, true, true]);
     expect(store.getReel("n3")!.analysis_status).toBe("pending");
     expect(store.getReel("n4")!.analysis_status).toBe("pending");
+
+    store.close();
+  });
+
+  it("an uncapped config (applyNoCap / Reprocess) analyzes ALL candidates in one run", async () => {
+    const store = openStore(":memory:");
+    // 5 reels with a base cap of 2 — capped this would analyze 2 and leave 3 over cap.
+    seedReels(store, "c", ["n0", "n1", "n2", "n3", "n4"]);
+    const capped = structuredClone(config);
+    capped.settings.max_analyses_per_run = 2;
+    const { port: gemini } = fakeGemini();
+    const { port: video } = fakeVideo();
+
+    // applyNoCap lifts the cap, so every drifted/pending candidate is processed at once.
+    const summary = await analyze({
+      creator: "c",
+      store,
+      config: applyNoCap(capped),
+      deps: { gemini, video },
+    });
+
+    expect(summary.analyzed).toBe(5);
+    expect(summary.remainingOverCap).toBe(0);
+    for (const sc of ["n0", "n1", "n2", "n3", "n4"]) {
+      expect(store.getReel(sc)!.analysis_status).toBe("analyzed");
+    }
 
     store.close();
   });
@@ -446,6 +473,217 @@ describe("analyze → Content Store (faked Gemini + Video)", () => {
     } finally {
       if (prev != null) process.env.GEMINI_API_KEY = prev;
     }
+    store.close();
+  });
+
+  it("scrapes up to N Comments per analyzed Reel and persists them to the comments corpus (#1)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+    const captured: { args: { shortcode: string; url: string; limit: number } }[] = [];
+    const apify: ApifyPort = {
+      async scrapeCreator() {
+        return { profile: { username: "c" }, reels: [] };
+      },
+      async scrapeComments(args) {
+        captured.push({ args });
+        return [
+          { comment_id: "k1", username: "a", text: "does it work?", likes: 4 },
+          { comment_id: "k2", username: "b", text: "love this", likes: 9 },
+        ];
+      },
+    };
+    const { port: gemini } = fakeGemini();
+    const { port: video } = fakeVideo();
+
+    // limit comes from settings.comments_per_reel (config fixture = 150).
+    await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].args).toEqual({
+      shortcode: "AAA",
+      url: "https://www.instagram.com/reel/AAA/",
+      limit: config.settings.comments_per_reel,
+    });
+    const rows = store.listComments("AAA");
+    expect(rows.map((r) => r.comment_id).sort()).toEqual(["k1", "k2"]);
+    expect(rows.find((r) => r.comment_id === "k2")!.text).toBe("love this");
+
+    store.close();
+  });
+
+  it("re-scraping a Reel's Comments accumulates the union by comment id (#2/#4): [c1,c2] then [c2,c3] → {c1,c2,c3}", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+
+    // The fake returns a DIFFERENT overlapping comment set on each scrapeComments call.
+    let call = 0;
+    const batches: ScrapedComment[][] = [
+      [
+        { comment_id: "c1", username: "a", text: "first batch one", likes: 2 },
+        { comment_id: "c2", username: "b", text: "shared comment", likes: 5 },
+      ],
+      [
+        { comment_id: "c2", username: "b", text: "shared comment", likes: 8 },
+        { comment_id: "c3", username: "d", text: "second batch three", likes: 1 },
+      ],
+    ];
+    const apify: ApifyPort = {
+      async scrapeCreator() {
+        return { profile: { username: "c" }, reels: [] };
+      },
+      async scrapeComments() {
+        return batches[Math.min(call++, batches.length - 1)];
+      },
+    };
+    const { port: gemini } = fakeGemini();
+    const { port: video } = fakeVideo();
+
+    // First analyze → pulls [c1, c2].
+    await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+    expect(store.listComments("AAA").map((r) => r.comment_id).sort()).toEqual(["c1", "c2"]);
+
+    // Force a re-analysis (drift the analysis hash) so analyze runs the Reel again and
+    // pulls the SECOND overlapping batch [c2, c3]. The corpus must be the UNION.
+    store.updateReelAnalysis({ shortcode: "AAA", analysis_prompt_hash: "deadbeefcafe" });
+
+    await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+
+    const rows = store.listComments("AAA");
+    expect(rows.map((r) => r.comment_id).sort()).toEqual(["c1", "c2", "c3"]);
+    // c1 survived the second pull (not clobbered); c2's likes refreshed to the newest pull.
+    expect(rows.find((r) => r.comment_id === "c2")!.likes).toBe(8);
+
+    store.close();
+  });
+
+  it("a stale analysis-hash Reel (pre-trigger-keyword) is a re-analysis candidate and gains the keyword (#1)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+    // Simulate a Reel analyzed under the PRE-slice-968 prompt: status=analyzed, the
+    // transcription hash is current, but the analysis hash predates the trigger_keyword
+    // prompt edit (so it differs from the CURRENT analysisPromptHash) → drift.
+    store.updateReelAnalysis({
+      shortcode: "AAA",
+      analysis_status: "analyzed",
+      analyzed_at: "2026-01-01T00:00:00.000Z",
+      transcript: "old transcript",
+      trigger_keyword: null, // not detected pre-slice-968
+      transcription_prompt_hash: transcriptionPromptHash(config),
+      analysis_prompt_hash: "0000oldhash00", // stale → drifted from current
+    });
+    // Sanity: the current analysis hash is NOT the stale one (the prompt edit bumped it).
+    expect(analysisPromptHash(config)).not.toBe("0000oldhash00");
+
+    const { port: gemini, transcribeCalls } = fakeGemini({
+      analysisFor: () => analysisResult({ trigger_keyword: "ritual" }),
+    });
+    const { port: video } = fakeVideo();
+
+    const summary = await analyze({ creator: "c", store, config, deps: { gemini, video } });
+
+    // The drifted Reel was re-analyzed (a candidate), not skipped.
+    expect(summary.analyzed).toBe(1);
+    expect(transcribeCalls).toEqual(["/tmp/AAA.mp4"]);
+    const reel = store.getReel("AAA")!;
+    expect(reel.trigger_keyword).toBe("ritual"); // keyword now populated
+    expect(reel.analysis_prompt_hash).toBe(analysisPromptHash(config)); // re-stamped to current
+    store.close();
+  });
+
+  it("emits a trigger_keyword, flags matching Comments is_trigger, and stores the keyword (#5)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+    const apify: ApifyPort = {
+      async scrapeCreator() {
+        return { profile: { username: "c" }, reels: [] };
+      },
+      async scrapeComments() {
+        return [
+          { comment_id: "t1", username: "a", text: "RITUAL", likes: 0 }, // exact → trigger
+          { comment_id: "t2", username: "b", text: "ritual please", likes: 0 }, // short token → trigger
+          { comment_id: "q1", username: "c", text: "does this work on the free plan?", likes: 12 }, // question, kept
+          { comment_id: "n1", username: "d", text: "this ritual changed my whole routine", likes: 4 }, // long mention, kept
+        ];
+      },
+    };
+    // The fake Gemini emits the Trigger Keyword (un-normalized — the analyze leg lowercases/trims).
+    const { port: gemini } = fakeGemini({ analysisFor: () => analysisResult({ trigger_keyword: "Ritual!" }) });
+    const { port: video } = fakeVideo();
+
+    const summary = await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+    expect(summary.analyzed).toBe(1);
+
+    // The normalized keyword is stored on the Reel.
+    expect(store.getReel("AAA")!.trigger_keyword).toBe("ritual");
+
+    // The two automation Comments are flagged is_trigger; the question + the long mention are not.
+    // (The dashboard's default view excludes is_trigger=1 and counts them — see
+    // content-labels.test.ts commentRowsToVMs; here we assert the store-state seam.)
+    const rows = store.listComments("AAA");
+    const flagged = rows.filter((r) => r.is_trigger === 1).map((r) => r.comment_id).sort();
+    expect(flagged).toEqual(["t1", "t2"]);
+    const unflagged = rows.filter((r) => r.is_trigger !== 1).map((r) => r.comment_id).sort();
+    expect(unflagged).toEqual(["n1", "q1"]);
+    // The trigger-Comment count (the CTA-response signal surfaced in the detail view).
+    expect(rows.reduce((n, r) => n + (r.is_trigger === 1 ? 1 : 0), 0)).toBe(2);
+
+    store.close();
+  });
+
+  it("re-analysis with a CHANGED trigger_keyword recomputes is_trigger non-destructively (slice 968)", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+    let keyword = "ritual";
+    const apify: ApifyPort = {
+      async scrapeCreator() {
+        return { profile: { username: "c" }, reels: [] };
+      },
+      async scrapeComments() {
+        return [
+          { comment_id: "k1", username: "a", text: "ritual", likes: 0 },
+          { comment_id: "k2", username: "b", text: "loop", likes: 0 },
+        ];
+      },
+    };
+    const { port: gemini } = fakeGemini({ analysisFor: () => analysisResult({ trigger_keyword: keyword }) });
+    const { port: video } = fakeVideo();
+
+    await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+    expect(store.listComments("AAA").find((r) => r.comment_id === "k1")!.is_trigger).toBe(1);
+    expect(store.listComments("AAA").find((r) => r.comment_id === "k2")!.is_trigger).toBe(0);
+
+    // Force a re-analysis with a DIFFERENT keyword; the flags must move, not double up.
+    keyword = "loop";
+    store.updateReelAnalysis({ shortcode: "AAA", analysis_prompt_hash: "deadbeefcafe" });
+    await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+
+    const rows = store.listComments("AAA");
+    expect(rows.find((r) => r.comment_id === "k1")!.is_trigger).toBe(0); // un-flagged
+    expect(rows.find((r) => r.comment_id === "k2")!.is_trigger).toBe(1); // newly flagged
+    expect(rows).toHaveLength(2); // nothing deleted
+    expect(store.getReel("AAA")!.trigger_keyword).toBe("loop");
+
+    store.close();
+  });
+
+  it("no scrapeComments-capable Apify port → analysis still succeeds, comment leg is a safe no-op", async () => {
+    const store = openStore(":memory:");
+    seedReels(store, "c", ["AAA"]);
+    // An Apify port WITHOUT scrapeComments (existing fakes shape) — the optional method.
+    const apify: ApifyPort = {
+      async scrapeCreator() {
+        return { profile: { username: "c" }, reels: [] };
+      },
+    };
+    const { port: gemini } = fakeGemini();
+    const { port: video } = fakeVideo();
+
+    const summary = await analyze({ creator: "c", store, config, deps: { apify, gemini, video } });
+    expect(summary.analyzed).toBe(1);
+    expect(store.getReel("AAA")!.analysis_status).toBe("analyzed");
+    // No comments written — corpus is empty, no throw.
+    expect(store.listComments("AAA")).toEqual([]);
+
     store.close();
   });
 });

@@ -15,6 +15,18 @@ _Avoid_: post, clip
 **Video**:
 The media file (the downloaded `.mp4`) for a Reel. Transient — fetched to feed AI analysis, then discarded. Distinct from the Reel record, which is durable.
 
+**Comment**:
+A viewer's text reply on a Reel — `{username, text, likes}` plus Instagram's native comment id. Scraped into its own Content Store table and accumulated across refreshes (upserted by comment id, never clobbered). The corpus from which FAQs are mined. Distinct from `comments_count`, the raw metric.
+_Avoid_: reply, remark
+
+**Trigger Keyword**:
+The word a Creator tells viewers to comment in order to fire a DM automation (commonly a ManyChat flow) — e.g. "comment RITUAL and I'll send you the link." Derived during video analysis and stored on the Reel. Comments matching it are flagged so they're excluded from FAQ mining and the default comments view, while their count survives as a CTA-response signal.
+_Avoid_: ManyChat keyword, automation word
+
+**FAQ**:
+A representative question mined from a Reel's Comments — many phrasings of the same ask (explicit or implied) clustered into one canonical question and linked to its supporting Comments. Carries `support_count`, `support_likes`, and a `strength_score` derived from those links (demand made countable, never an LLM-claimed number). The signal for what a remake should answer.
+_Avoid_: question, theme
+
 **Shortcode**:
 Instagram's native unique identifier for a Reel (the segment in `instagram.com/reel/<shortcode>/`). Used as the Content Store's primary key and the basis for traceability back to the original.
 
@@ -42,3 +54,23 @@ A boolean flag on a Reel, true when `likes ≥ 5 × followers` measured at scrap
 
 **Outlier**:
 A Reel whose engagement-rate exceeds this Creator's own mean + 2σ — i.e. it overperformed the creator's own baseline. Creator-relative, not absolute.
+
+**Draft**:
+The user-owned "your version" of a Reel: an on-demand Claude generation — 3 editable hook options, per-beat talking-points scripts mirroring the Reel's analyzed beats, a FAQ-aware reasoning section, and a caption — seeded from the Reel's analysis and FAQs, then hand-edited and saved. One per Reel (1:1); regenerating is a destructive full-replace (no history). The richest of the user-authored, mutable artifacts (see Favorite), distinct from the immutable analysis it's seeded from.
+_Avoid_: your version, remix, remake
+
+**Favorite**:
+A user's boolean star on a Reel — mutable, user-authored state (ADR-0006), set/cleared from the dashboard and persisted to the Reel (`is_favorite` + `favorited_at`). No pipeline run produces or clobbers it. Drives the library's "Favorites only" filter. The simplest user-state flag, alongside the Draft and the Archive flag.
+_Avoid_: star, like, bookmark, save
+
+**Archive**:
+A user's boolean "set aside" flag on a Reel — mutable, user-authored state (ADR-0006), set/cleared from the dashboard and persisted to the Reel (`is_archived` + `archived_at`). No pipeline run produces or clobbers it. **Hidden by default everywhere in the library** — a "Show archived" toggle reveals archived Reels and composes with "Favorites only". **Archive wins over Favorite**: an archived Favorite stays hidden unless "Show archived" is on. The second user-state flag, alongside the Favorite and the Draft.
+_Avoid_: delete, hide, trash, remove
+
+**Refresh**:
+The cheap, analysis-preserving per-Reel update fired from the dashboard: re-pull engagement metrics + Comments, re-flag triggers, and re-mine FAQs. It NEVER downloads the Video or calls Gemini — the immutable analysis (transcript/topic/category/beats/why/keyword) is left untouched (ADR-0004/0007). Re-deriving the analysis after a prompt change is NOT Refresh's job; that is a Reprocess.
+_Avoid_: update, re-pull, sync
+
+**Reprocess**:
+A deliberate re-derivation of the immutable analysis after a video-analysis prompt or schema change — mechanically a `full` pipeline run with the per-run **processing** caps lifted (CLI `--no-cap` → `max_analyses_per_run` + `max_faq_extractions_per_run`), so every drifted Reel (ADR-0003/0004 hash drift) in the tracked working set is re-analyzed in one pass rather than the newest `max_analyses_per_run`. A rare maintenance operation, not a per-Reel button: a prompt edit drifts the rendered hash for ALL Reels at once, so the natural unit is the backlog, not one Reel. Reprocess re-analyzes **what's already tracked** (bounded by `results_limit` + the 90-day window) — it does not widen coverage; pulling more of the window is a separate, deliberate `results_limit` change.
+_Avoid_: re-analyze, deep refresh, regenerate

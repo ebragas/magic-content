@@ -35,13 +35,20 @@
 import type { AppConfig } from "./config.js";
 import {
   analysisPromptHash,
+  faqPromptHash,
   loadConfig,
   renderAnalysisPrompt,
   transcriptionPromptHash,
 } from "./config.js";
+import { scrapeAndStoreComments } from "./comments.js";
+import { extractFaqsForReel, needsFaqExtraction } from "./faqs.js";
+import { resolveApify } from "./scrape.js";
+import { normalizeTriggerKeyword } from "./trigger.js";
 import { normalizeUsername } from "./username.js";
 import type {
   AnalyzeResultSummary,
+  AnthropicPort,
+  ApifyPort,
   Beat,
   BeatLabel,
   Deps,
@@ -205,6 +212,24 @@ async function resolvePorts(
 }
 
 /**
+ * Lazily build the real Anthropic adapter when the caller didn't inject one and
+ * ANTHROPIC_API_KEY is set (mirrors the Gemini/Apify resolution, ADR-0008). Imported
+ * dynamically so the SDK is NEVER pulled in by tests, which always inject a fake.
+ * Returns undefined when there's no port and no key → the FAQ leg is a safe no-op.
+ */
+export async function resolveAnthropic(
+  deps: Deps | undefined,
+  config: AppConfig,
+): Promise<AnthropicPort | undefined> {
+  if (deps?.anthropic) return deps.anthropic;
+  if (process.env.ANTHROPIC_API_KEY) {
+    const { makeAnthropicPort } = await import("./adapters/anthropic.js");
+    return makeAnthropicPort(config);
+  }
+  return undefined;
+}
+
+/**
  * Analyze a creator's candidate Reels, first-time-before-re-analysis and NEWEST-FIRST
  * within each group, stopping at `max_analyses_per_run` (#4). Reels beyond the cap are
  * left un-analyzed and REPORTED (no silent truncation). Each analyzed Reel stamps both
@@ -222,6 +247,15 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
   const username = normalizeUsername(creator);
 
   const { gemini, video } = await resolvePorts(args.deps);
+  // Comment scraping rides the SAME Apify resolution as scrape/refresh (HARD
+  // INVARIANT #2): an injected fake apify is used as-is; otherwise the real adapter
+  // engages only when APIFY_TOKEN is set. When neither is available (or the resolved
+  // port lacks scrapeComments), the comment leg is a safe no-op (see scrapeAndStoreComments).
+  const apify: ApifyPort | undefined = await resolveApify(args.deps);
+  // The FAQ leg's LLM (Claude) is its OWN port (ADR-0008), resolved independently of Gemini:
+  // an injected fake anthropic is used as-is; otherwise the real adapter engages only when
+  // ANTHROPIC_API_KEY is set. With neither, the FAQ leg is a safe no-op.
+  const anthropic: AnthropicPort | undefined = await resolveAnthropic(args.deps, config);
 
   // Fully-rendered prompt hashes (analysis hash is AFTER category injection).
   const currentAnalysisHash = analysisPromptHash(config);
@@ -230,6 +264,7 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
   const transcriptionPrompt = config.prompts.transcription;
   const model = config.settings.gemini_model;
   const cap = config.settings.max_analyses_per_run;
+  const commentsPerReel = config.settings.comments_per_reel;
 
   // Candidates, NEWEST-FIRST (posted_at DESC, NULLs last — Store enforces it).
   // A candidate is un-analyzed OR analyzed-but-prompt-hash-drifted (re-analysis).
@@ -253,12 +288,23 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
 
   args.onProgress?.("analyze", 0, total);
 
-  // No Gemini available (no injected port + no API key): safe no-op. Nothing is
-  // analyzed; the cap report still reflects what WOULD have been left over, and
-  // `skipped` reports already-analyzed Reels consistently with the real path.
+  // No Gemini available (no injected port + no API key): no video analysis. But the FAQ leg
+  // is INDEPENDENT (ADR-0007/0008) — a Reel already video-analyzed in an earlier run may still
+  // need FAQ work — so we still run the FAQ pass before returning. `skipped` reports
+  // already-analyzed Reels consistently with the real path; the cap report reflects the
+  // over-cap remainder that WOULD have been left over.
   if (!gemini || !video) {
     const skipped = all.length - candidates.length;
-    return { creator: username, analyzed: 0, skipped, failed: 0, remainingOverCap };
+    const faq = await runFaqPass({ store, username, config, anthropic });
+    return {
+      creator: username,
+      analyzed: 0,
+      skipped,
+      failed: 0,
+      remainingOverCap,
+      faqExtracted: faq.faqExtracted,
+      faqRemainingOverCap: faq.faqRemainingOverCap,
+    };
   }
 
   let analyzed = 0;
@@ -316,6 +362,8 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
 
       const category = validateCategory(analysis.category, config);
       const beat_sequence = sanitizeBeats(analysis.beat_sequence);
+      // The Reel's Trigger Keyword (slice 968): normalize lowercase/trim, empty → null.
+      const trigger_keyword = normalizeTriggerKeyword(analysis.trigger_keyword);
 
       store.updateReelAnalysis({
         shortcode: reel.shortcode,
@@ -328,12 +376,30 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
         hook_technique: coerceHookTechnique(analysis.hook_technique),
         beat_sequence,
         why_it_works: analysis.why_it_works ?? null,
+        trigger_keyword,
         analysis_status: "analyzed",
         analysis_error: null,
         analyzed_at: new Date().toISOString(),
         transcription_prompt_hash: currentTranscriptionHash,
         analysis_prompt_hash: currentAnalysisHash,
       });
+      // Couple the dedicated, ACCUMULATING Comment scrape into the analyze leg
+      // (MAIN-966): scrape up to comments_per_reel Comments for this Reel and UPSERT
+      // them by comment_id so the corpus grows across runs. Best-effort + a no-op
+      // when no scrapeComments-capable Apify port is available; the analysis above
+      // has already been persisted, so a comment fetch must never undo it.
+      await scrapeAndStoreComments({
+        shortcode: reel.shortcode,
+        url: reel.url,
+        limit: commentsPerReel,
+        store,
+        apify,
+      });
+      // (slice 968) Now that the Trigger Keyword is known, (re)compute the is_trigger
+      // flag across this Reel's whole Comment corpus — a non-destructive UPDATE, so it
+      // correctly flags Comments scraped in an EARLIER run (the refresh-before-analyze
+      // case) as well as the ones just upserted above. A null keyword un-flags all.
+      store.flagTriggerComments(reel.shortcode, trigger_keyword);
       analyzed += 1;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -380,11 +446,65 @@ export async function analyze(args: AnalyzeArgs): Promise<AnalyzeResultSummary> 
     }
   }
 
+  // FAQ leg (MAIN-969): runs AFTER the video loop so it sees the Comments just scraped + the
+  // Reels just analyzed. It is INDEPENDENT — its own cap, its own re-run predicate (ADR-0007) —
+  // and reads store state, so it also picks up Reels analyzed in earlier runs whose FAQs are
+  // missing/stale. Crucially it never touches the Gemini/Video ports, so a pure FAQ backfill
+  // does NOT re-invoke them.
+  const faq = await runFaqPass({ store, username, config, anthropic });
+
   // `skipped` = already-up-to-date Reels that weren't candidates (build-spec.md) PLUS
   // candidates we couldn't attempt for lack of a fresh Video URL (#2) — both are
   // skipped, not failed.
   const skipped = all.length - candidates.length + urlMissSkipped;
-  return { creator: username, analyzed, skipped, failed, remainingOverCap };
+  return {
+    creator: username,
+    analyzed,
+    skipped,
+    failed,
+    remainingOverCap,
+    faqExtracted: faq.faqExtracted,
+    faqRemainingOverCap: faq.faqRemainingOverCap,
+  };
+}
+
+/**
+ * The FAQ extraction pass (MAIN-969 / ADR-0007). Capped INDEPENDENTLY of the analysis cap by
+ * max_faq_extractions_per_run so an exhausted analysis cap never starves FAQ work and vice-versa.
+ *
+ * Candidates: Reels already video-analyzed (analysis_status === "analyzed") whose FAQs are
+ * absent | faq_prompt_hash drifted | Comments were re-pulled since the last FAQ run
+ * (needsFaqExtraction). Never-analyzed Reels are excluded — they have no meaningful Comment
+ * corpus / topic-transcript context to mine. NEWEST-FIRST, capped, no silent truncation.
+ *
+ * Uses ONLY the Anthropic port — never Gemini/Video — so a backfill on an already-analyzed Reel
+ * does NOT re-invoke the video ports. A safe no-op (zero work) when no Anthropic port is available.
+ */
+async function runFaqPass(args: {
+  store: Store;
+  username: string;
+  config: AppConfig;
+  anthropic: AnthropicPort | undefined;
+}): Promise<{ faqExtracted: number; faqRemainingOverCap: number }> {
+  const { store, username, config, anthropic } = args;
+  if (!anthropic) return { faqExtracted: 0, faqRemainingOverCap: 0 };
+
+  const currentFaqHash = faqPromptHash(config);
+  const faqCap = config.settings.max_faq_extractions_per_run;
+
+  const all = store.listReels({ creator: username, orderBy: "posted_at", direction: "desc" });
+  const candidates = all.filter(
+    (r) => r.analysis_status === "analyzed" && needsFaqExtraction(r, store, currentFaqHash),
+  );
+  const toExtract = candidates.slice(0, faqCap);
+  const faqRemainingOverCap = candidates.length - toExtract.length;
+
+  let faqExtracted = 0;
+  for (const reel of toExtract) {
+    const result = await extractFaqsForReel({ reel, store, config, anthropic });
+    if (result.ran) faqExtracted += 1;
+  }
+  return { faqExtracted, faqRemainingOverCap };
 }
 
 /**

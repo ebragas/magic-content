@@ -53,6 +53,9 @@ const ANALYSIS_SCHEMA: Schema = {
       },
     },
     why_it_works: { type: Type.STRING },
+    // Nullable: the ManyChat CTA word (or null if the Reel has none). Marked
+    // nullable + omitted from `required` so the model can return null cleanly.
+    trigger_keyword: { type: Type.STRING, nullable: true },
   },
   required: [
     "transcript",

@@ -228,32 +228,31 @@ export function extractManychatKeywords(caption: string | null | undefined): Set
   return keywords;
 }
 
+/** A raw comment as the ManyChat read-time heuristic consumes it (source-agnostic). */
+export interface RawComment {
+  username?: string | null;
+  text?: string | null;
+  likes?: number | null;
+}
+
 /**
- * Decode top_comments JSON → comment VMs, questions first then by likes, with
- * ManyChat keyword-automation noise stripped so meaningful comments surface.
+ * DEPRECATED (slice 968): the legacy read-time ManyChat filter + ranking. It guessed
+ * which Comments were automation triggers by parsing the caption's CTA and finding
+ * repeated short tokens — a fuzzy heuristic. Slice 968 RETIRES that guess in favor of
+ * the stored, EXACT `comments.is_trigger` flag (set by flagTriggerComments against the
+ * Reel's analyzed trigger_keyword): the corpus display path (commentRowsToVMs) now
+ * filters on is_trigger, not on this heuristic.
  *
- * Creators run automations ("comment LOOP and I'll DM you the link") that fill the
- * top comments with repeated one-word triggers plus the creator's own auto-replies
- * ("just sent!!"). We drop a comment when it (a) matches a trigger keyword parsed
- * from the caption, (b) is a short token that repeats in the sample, or (c) is the
- * creator's own reply — but NEVER a question (those are always meaningful). Filtering
- * is at read time and non-destructive: the raw top_comments column is untouched, so
- * the heuristic can be tuned later without a re-scrape. Bad/empty JSON → [].
+ * This pure helper is retained ONLY for the inline top_comments snapshot path
+ * (decodeComments) — that JSON has no is_trigger flag, so the snapshot still leans on
+ * the caption parse — and for its existing unit tests. It is NO LONGER on the dashboard's
+ * corpus read path. Returns VMs with questions first, then by likes; non-destructive.
  */
-export function decodeComments(
-  json: string | null,
+export function rankComments(
+  comments: RawComment[],
   opts: { caption?: string | null; creatorUsername?: string | null } = {},
 ): CommentVM[] {
-  if (!json) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed)) return [];
-
-  const raw = (parsed as { username?: string; text?: string; likes?: number }[])
+  const raw = comments
     .filter((c) => c && typeof c.text === "string" && c.text.trim())
     .map((c) => {
       const text = c.text!.trim();
@@ -300,6 +299,61 @@ export function decodeComments(
       return !isManychatNoise(c);
     })
     .map(({ username, text, likes, isQuestion }) => ({ username, text, likes, isQuestion }))
+    .sort((a, b) => {
+      if (a.isQuestion !== b.isQuestion) return a.isQuestion ? -1 : 1;
+      return b.likes - a.likes;
+    });
+}
+
+/**
+ * Decode top_comments JSON → comment VMs via the shared ManyChat heuristic. Retained
+ * for the inline snapshot path + its existing tests; the detail view now reads the
+ * dedicated `comments` corpus instead (commentRowsToVMs). Bad/empty JSON → [].
+ */
+export function decodeComments(
+  json: string | null,
+  opts: { caption?: string | null; creatorUsername?: string | null } = {},
+): CommentVM[] {
+  if (!json) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return rankComments(parsed as RawComment[], opts);
+}
+
+/** A `comments` corpus row as the corpus display path consumes it (carries the flag). */
+export interface CorpusCommentRow {
+  username: string | null;
+  text: string | null;
+  likes: number | null;
+  /** 1 when flagged a Trigger-Keyword (ManyChat) comment by flagTriggerComments. */
+  is_trigger?: number | null;
+}
+
+/**
+ * Decode the dedicated `comments` corpus rows → comment VMs (MAIN-966) for the detail
+ * view. Slice 968 RETIRES the fuzzy read-time ManyChat heuristic here: the default view
+ * EXCLUDES Comments flagged is_trigger = 1 (set precisely by flagTriggerComments against
+ * the Reel's analyzed trigger_keyword) — no caption guessing, no repetition fingerprint.
+ * Questions-first ordering is preserved (then by likes); the underlying store rows are
+ * untouched (non-destructive), so the count of excluded triggers survives as a signal.
+ */
+export function commentRowsToVMs(rows: CorpusCommentRow[]): CommentVM[] {
+  return rows
+    .filter((c) => c && c.is_trigger !== 1 && typeof c.text === "string" && c.text.trim())
+    .map((c) => {
+      const text = c.text!.trim();
+      return {
+        username: c.username ?? "",
+        text,
+        likes: c.likes ?? 0,
+        isQuestion: text.includes("?"),
+      };
+    })
     .sort((a, b) => {
       if (a.isQuestion !== b.isQuestion) return a.isQuestion ? -1 : 1;
       return b.likes - a.likes;

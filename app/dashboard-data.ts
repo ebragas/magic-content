@@ -20,6 +20,7 @@ import type {
   ListReelsOptions,
 } from "../lib/core/types.js";
 import {
+  commentRowsToVMs,
   decodeBeats,
   decodeComments,
   hookDescription,
@@ -221,8 +222,58 @@ export interface ReelVM {
   whyPull: string;
   /** Remainder of why_it_works (may be empty). */
   why: string;
-  /** Top comments (questions first), for the detail "Questions from comments" block. */
+  /** Top comments (questions first), for the detail "Questions from comments" block.
+   *  Excludes Trigger-Keyword (is_trigger=1) Comments (slice 968). */
   topComments: CommentVM[];
+  /** The Reel's analyzed Trigger Keyword (ManyChat CTA word), or null. */
+  triggerKeyword: string | null;
+  /** Count of Comments flagged is_trigger=1 — a CTA-response signal (slice 968). */
+  triggerCommentCount: number;
+  /** FAQs mined from this Reel's non-trigger Comments, ranked by strength (MAIN-969). */
+  faqs: FaqVM[];
+  /** User-authored Favorite flag (ADR-0006 / MAIN-965). The client filters + toggles on this. */
+  isFavorite: boolean;
+  /** ISO-8601 UTC when favorited, or null. */
+  favoritedAt: string | null;
+  /** User-authored Archive flag (ADR-0006 / MAIN-967). The client hides these by default;
+   *  the "Show archived" toggle reveals them. Archive wins over favorite. */
+  isArchived: boolean;
+  /** ISO-8601 UTC when archived, or null. */
+  archivedAt: string | null;
+  /**
+   * The user's generated Draft — the "your version" of this Reel (MAIN-971 / ADR-0006/0008), or
+   * null when none has been generated yet. The detail view renders the stored Draft; a null draft
+   * shows the "Generate" CTA. Replaces the old session-local "Your version" scaffold.
+   */
+  draft: DraftVM | null;
+}
+
+/**
+ * One Draft as the detail view consumes it (MAIN-971): 3 hook options (one subtly suggested),
+ * per-beat talking-points scripts aligned to the analyzed beats, the FAQ-aware reasoning, the
+ * generated caption, and when it was last generated. Plain, serializable data.
+ */
+export interface DraftVM {
+  hooks: { text: string; suggested: boolean }[];
+  beatScripts: { label: string; script: string }[];
+  reasoning: string;
+  caption: string;
+  generatedAt: string;
+  updatedAt: string;
+}
+
+/**
+ * One FAQ as the detail view consumes it (MAIN-969): the canonical question, its three
+ * REAL-link-derived counts, and its example Comments (from the join, expandable). Plain,
+ * serializable data — the server resolves it once via getAppData.
+ */
+export interface FaqVM {
+  question: string;
+  supportCount: number;
+  supportLikes: number;
+  strengthScore: number;
+  /** The Comments supporting this FAQ (likes DESC), shown when the FAQ is expanded. */
+  examples: CommentVM[];
 }
 
 /** One tracked Creator as the Creators view consumes it. */
@@ -283,7 +334,10 @@ export function getAppData(store?: Store): AppData {
   const ownsStore = store == null;
   const s = store ?? openStore();
   try {
-    const reels = s.listReels({ orderBy: "posted_at", direction: "desc" });
+    // includeArchived: true — load the WHOLE set (archived included) so the client shell
+    // holds everything; the default hide + "Show archived" toggle (slice 967) is applied
+    // client-side over this set, not by the Store read.
+    const reels = s.listReels({ orderBy: "posted_at", direction: "desc", includeArchived: true });
 
     // Authored slug → display name from config/categories.yaml (the prompt's source
     // of truth). Labels resolve here; title-case is only a defensive fallback.
@@ -337,14 +391,64 @@ export function getAppData(store?: Store): AppData {
         durationSec: reel.duration_sec,
         postedAt: reel.posted_at,
         analysisStatus: reel.analysis_status,
+        isFavorite: reel.is_favorite === 1,
+        favoritedAt: reel.favorited_at,
+        isArchived: reel.is_archived === 1,
+        archivedAt: reel.archived_at,
+        // The stored Draft (MAIN-971), or null when none generated yet. Decoded JSON arrays are
+        // already parsed by the Store (getDraft); map to the camelCase VM the client renders.
+        draft: (() => {
+          const d = s.getDraft(reel.shortcode);
+          if (!d) return null;
+          return {
+            hooks: d.hooks,
+            beatScripts: d.beat_scripts.map((b) => ({ label: b.label, script: b.script })),
+            reasoning: d.reasoning,
+            caption: d.caption,
+            generatedAt: d.generated_at,
+            updatedAt: d.updated_at,
+          };
+        })(),
         beats: decodeBeats(reel.beat_sequence),
         transcript: reel.transcript,
         whyPull: pull,
         why: body,
-        topComments: decodeComments(reel.top_comments, {
-          caption: reel.caption,
-          creatorUsername: reel.creator_username,
-        }),
+        // Source the detail view's Comments from the dedicated, accumulating `comments`
+        // corpus (MAIN-966) rather than the thin inline top_comments JSON. Slice 968
+        // RETIRES the fuzzy read-time ManyChat heuristic: the corpus path now filters on
+        // the stored, EXACT is_trigger flag (commentRowsToVMs excludes is_trigger=1).
+        // Falls back to the inline snapshot — still via the legacy caption heuristic,
+        // since that JSON has no flag — for Reels with no corpus yet (analyzed before this
+        // slice / before a comment scrape landed).
+        ...(() => {
+          const corpus = s.listComments(reel.shortcode);
+          const triggerCommentCount = corpus.reduce(
+            (n, c) => n + (c.is_trigger === 1 ? 1 : 0),
+            0,
+          );
+          const topComments = corpus.length
+            ? commentRowsToVMs(corpus)
+            : decodeComments(reel.top_comments, {
+                caption: reel.caption,
+                creatorUsername: reel.creator_username,
+              });
+          // FAQs (MAIN-969): ranked by strength desc, each with its example Comments from the
+          // join. Counts come straight off the snapshotted faqs row (REAL-link-derived); the
+          // examples are live-queried Comment rows mapped to the same CommentVM shape.
+          const faqs: FaqVM[] = s.listFaqs(reel.shortcode).map((f) => ({
+            question: f.question,
+            supportCount: f.support_count,
+            supportLikes: f.support_likes,
+            strengthScore: f.strength_score,
+            examples: f.examples.map((c) => ({
+              username: c.username ?? "",
+              text: (c.text ?? "").trim(),
+              likes: c.likes ?? 0,
+              isQuestion: typeof c.text === "string" && c.text.includes("?"),
+            })),
+          }));
+          return { topComments, triggerKeyword: reel.trigger_keyword, triggerCommentCount, faqs };
+        })(),
       };
     });
 

@@ -8,5 +8,23 @@ results_limit: 50
 # Already-analyzed (unchanged-prompt-hash) Reels are skipped and don't count. Default 25.
 max_analyses_per_run: 25
 
+# Per Reel, `analyze` scrapes up to this many Comments (newest + top-liked) into the
+# dedicated accumulating `comments` corpus (MAIN-966). Default 150.
+comments_per_reel: 150
+
 # Gemini model used for both transcription and video analysis.
 gemini_model: gemini-2.5-flash
+
+# Per run, FAQ extraction processes newest-first and stops at this many NEW (or stale)
+# FAQ runs. Caps INDEPENDENTLY of max_analyses_per_run — one exhausted must not block the
+# other, so a FAQ backfill leg runs even when no video analyses are due (ADR-0007). Default 25.
+max_faq_extractions_per_run: 25
+
+# Claude model used for FAQ clustering (extractFaqs). Cheap Haiku for the high-volume,
+# mechanical clustering work (ADR-0008). Draft generation (slice 971) uses a stronger model.
+faq_model: claude-haiku-4-5
+
+# Claude model used for Draft generation (generateDraft, slice 971). The stronger Sonnet —
+# the Draft is the feature's payoff, where instruction-following + writing quality matter most
+# (ADR-0008). On-demand only, so not bounded by a per-run batch cap.
+draft_model: claude-sonnet-4-6

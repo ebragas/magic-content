@@ -16,6 +16,7 @@ import { ApifyClient } from "apify-client";
 import type {
   ApifyPort,
   ScrapeResult,
+  ScrapedComment,
   ScrapedCreatorProfile,
   ScrapedReel,
   TopComment,
@@ -69,6 +70,48 @@ function mapComments(v: unknown): TopComment[] | null {
     if (text) out.push({ username, text, likes });
   }
   return out.length ? out : null;
+}
+
+/**
+ * Map Instagram's native comment id robustly. The actor surfaces it under varying
+ * keys across dataset shapes (`id`, `pk`, `commentId`); coerce numbers to strings so
+ * a numeric pk still dedupes. Returns null when no id is present (the comment can't
+ * be deduped into the corpus and is dropped).
+ */
+function commentId(raw: Item): string | null {
+  const candidates = [raw.id, raw.pk, raw.commentId];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c;
+    if (typeof c === "number" && Number.isFinite(c)) return String(c);
+  }
+  return null;
+}
+
+/** Map a single Apify `comments` item → ScrapedComment. Pure (testable). Null when un-id'd. */
+export function mapScrapedComment(raw: Item): ScrapedComment | null {
+  const id = commentId(raw);
+  if (!id) return null;
+  const owner = raw.owner as Item | undefined;
+  return {
+    comment_id: id,
+    username: str(raw.ownerUsername) ?? str(owner?.username),
+    text: str(raw.text),
+    likes: num(raw.likesCount),
+    posted_at: str(raw.timestamp),
+  };
+}
+
+/** Map an Apify `comments` dataset → ScrapedComment[], dropping un-id'd items, deduped. Pure. */
+export function mapScrapedComments(items: Item[]): ScrapedComment[] {
+  const out: ScrapedComment[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const c = mapScrapedComment(item);
+    if (!c || seen.has(c.comment_id)) continue;
+    seen.add(c.comment_id);
+    out.push(c);
+  }
+  return out;
 }
 
 /**
@@ -173,6 +216,20 @@ export function makeApifyPort(): ApifyPort {
       });
 
       return { profile, reels: mapReels(postItems) };
+    },
+
+    async scrapeComments({ shortcode, url, limit }): Promise<ScrapedComment[]> {
+      // A dedicated `comments` run against the Reel's canonical post URL. The actor
+      // returns up to `resultsLimit` comments (newest + top-liked); we re-cap the
+      // mapped result defensively. shortcode is accepted for symmetry/logging — the
+      // actor keys off the post URL.
+      void shortcode;
+      const items = await runActor({
+        directUrls: [url],
+        resultsType: "comments",
+        resultsLimit: limit,
+      });
+      return mapScrapedComments(items).slice(0, limit);
     },
   };
 }

@@ -4,7 +4,7 @@
 // apify/instagram-scraper's actual item shapes so a live scrape lands correctly.
 
 import { describe, expect, it } from "vitest";
-import { mapProfile, mapReel, mapReels } from "./apify.js";
+import { mapProfile, mapReel, mapReels, mapScrapedComment, mapScrapedComments } from "./apify.js";
 
 describe("mapProfile (apify `details` item)", () => {
   it("maps identity + follower/following/posts counts", () => {
@@ -109,5 +109,48 @@ describe("mapReels (apify `posts` dataset)", () => {
       { type: "Video", videoUrl: "c" }, // dropped — no shortcode
     ]);
     expect(reels.map((r) => r.shortcode)).toEqual(["VID1", "CLIP"]);
+  });
+});
+
+describe("mapScrapedComment (apify `comments` item)", () => {
+  it("maps id/username/text/likes/posted_at to the corpus shape", () => {
+    expect(
+      mapScrapedComment({
+        id: "17900000000000000",
+        ownerUsername: "fan1",
+        text: "does this work on the free plan?",
+        likesCount: 12,
+        timestamp: "2026-06-01T00:00:00.000Z",
+      }),
+    ).toEqual({
+      comment_id: "17900000000000000",
+      username: "fan1",
+      text: "does this work on the free plan?",
+      likes: 12,
+      posted_at: "2026-06-01T00:00:00.000Z",
+    });
+  });
+
+  it("maps the native id robustly from id/pk/commentId, coercing a numeric pk to string", () => {
+    expect(mapScrapedComment({ pk: 42, text: "hi" })!.comment_id).toBe("42");
+    expect(mapScrapedComment({ commentId: "abc", text: "hi" })!.comment_id).toBe("abc");
+    // owner.username fallback when ownerUsername is absent.
+    expect(mapScrapedComment({ id: "x", owner: { username: "nested" }, text: "hi" })!.username).toBe("nested");
+  });
+
+  it("returns null when no comment id is present (can't be deduped)", () => {
+    expect(mapScrapedComment({ text: "no id here" })).toBeNull();
+  });
+});
+
+describe("mapScrapedComments (apify `comments` dataset)", () => {
+  it("drops un-id'd items and dedupes by comment_id", () => {
+    const comments = mapScrapedComments([
+      { id: "c1", text: "one" },
+      { text: "no id" }, // dropped
+      { pk: 2, text: "two" },
+      { id: "c1", text: "one-dup" }, // deduped
+    ]);
+    expect(comments.map((c) => c.comment_id)).toEqual(["c1", "2"]);
   });
 });

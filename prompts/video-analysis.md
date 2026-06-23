@@ -11,7 +11,8 @@ Return ONLY a single JSON object (no markdown fences, no commentary) with EXACTL
   "beat_sequence": [
     { "label": "string — one beat label from the Beat Vocabulary below", "start_pct": 0, "end_pct": 8, "text": "string — the verbatim transcript words spoken during this beat (\"\" if the beat has no speech)" }
   ],
-  "why_it_works": "string — 2–3 sentences on why this Reel does or doesn't earn attention and retention, grounded in the hook and beats."
+  "why_it_works": "string — 2–3 sentences on why this Reel does or doesn't earn attention and retention, grounded in the hook and beats.",
+  "trigger_keyword": "string|null — the single CTA word the creator tells viewers to COMMENT to fire a DM automation (commonly a ManyChat flow), e.g. \"comment RITUAL and I'll send you the link\" → \"ritual\". Read it from the spoken audio or the on-screen/caption call-to-action. Return the bare word, lowercased, no quotes or punctuation. Use null when the Reel has no such comment-to-DM CTA (a generic \"comment below\" or \"follow for more\" is NOT a trigger keyword)."
 }
 ```
 

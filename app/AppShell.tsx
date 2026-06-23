@@ -15,12 +15,15 @@
 // "Structure" shows the beat timeline + legend + full transcript (the comp's
 // per-beat verbatim lines aren't a stored field); "Why it works" splits the stored
 // rationale into a serif pull-quote + body; "Questions from comments" surfaces the
-// stored top_comments (questions first); "Your version" is an editable draft
-// scaffold seeded from the Reel's real hook/caption/beats (no generation backend).
+// stored top_comments (questions first). "Your version" renders the user's GENERATED,
+// PERSISTED Draft (MAIN-971): 3 hook options (one suggested), per-beat talking-points
+// scripts, FAQ-aware reasoning, and a caption — Generate when none exists, Regenerate
+// (confirmed destructive full-replace) otherwise (POST /api/reels/{shortcode}/draft).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import type { AppData, CreatorVM, ReelVM } from "./dashboard-data.js";
+import { useRouter } from "next/navigation";
+import type { AppData, CreatorVM, DraftVM, FaqVM, ReelVM } from "./dashboard-data.js";
 import { fmt, formatDuration } from "./content-labels.js";
 
 // ── Run API types (mirror app/api/content-pipeline/runs registry contract) ──
@@ -100,22 +103,67 @@ export interface AppShellProps {
   initialCreator?: string | null;
 }
 
+/**
+ * Structural equality over a Draft's USER-EDITABLE fields (MAIN-972) — the dirty test for the
+ * "Your version" editor. Compares the 3 hooks (text + suggested), the per-beat scripts, the
+ * reasoning, and the caption; ignores generated_at/updated_at (a save bumps updated_at without the
+ * edit being "different"). A simple field-by-field compare — the arrays are tiny + fixed-shape.
+ */
+function draftFieldsEqual(a: DraftVM, b: DraftVM): boolean {
+  if (a.reasoning !== b.reasoning || a.caption !== b.caption) return false;
+  if (a.hooks.length !== b.hooks.length) return false;
+  for (let i = 0; i < a.hooks.length; i++) {
+    if (a.hooks[i].text !== b.hooks[i].text || a.hooks[i].suggested !== b.hooks[i].suggested) return false;
+  }
+  if (a.beatScripts.length !== b.beatScripts.length) return false;
+  for (let i = 0; i < a.beatScripts.length; i++) {
+    if (a.beatScripts[i].label !== b.beatScripts[i].label || a.beatScripts[i].script !== b.beatScripts[i].script) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function AppShell({ data, initialView = "library", initialCreator = null }: AppShellProps) {
+  const router = useRouter();
   const [view, setView] = useState<View>(initialView);
   const [rowStyle, setRowStyle] = useState<RowStyle>("signal");
   const [sort, setSort] = useState<SortKey>("performance");
   const [search, setSearch] = useState("");
   const [viralOnly, setViralOnly] = useState(false);
   const [outlierOnly, setOutlierOnly] = useState(false);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [creatorFilter, setCreatorFilter] = useState<string | null>(initialCreator);
   const [selected, setSelected] = useState<string | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
 
-  // ── Detail "Your version" draft (local-only scaffold) ──
-  const [remixHook, setRemixHook] = useState("");
-  const [remixCaption, setRemixCaption] = useState("");
-  const [copied, setCopied] = useState(false);
+  // ── Detail "Your version" Draft (MAIN-971: generated + persisted) ──
+  // Optimistic Draft overrides keyed by shortcode: a (re)generation POSTs in the background and,
+  // on success, stamps the freshly-generated Draft locally so the detail view updates without a
+  // full page reload. The server-loaded ReelVM.draft is the source of truth on first render; an
+  // override (once set) wins. draftPhase drives the Generate/Regenerate button + feedback line.
+  const [draftOverrides, setDraftOverrides] = useState<Record<string, DraftVM>>({});
+  type DraftPhase = "idle" | "generating" | "error";
+  const [draftPhase, setDraftPhase] = useState<DraftPhase>("idle");
+  const [draftMsg, setDraftMsg] = useState<string | null>(null);
+
+  // ── Detail "Your version" Draft EDITING (MAIN-972: hand-edit + Save persisted across sessions) ──
+  // draftEdits holds the in-progress, editable COPY of a Reel's Draft keyed by shortcode — seeded
+  // from the persisted Draft the first time a field is touched. The persisted Draft (draftFor) is the
+  // clean baseline; the entry is DIRTY when its JSON differs from that baseline. Save PUTs the edits
+  // to /api/reels/{shortcode}/draft, then stamps the returned Draft as the new baseline (override) AND
+  // clears the edit entry → clean again. A regenerate (which full-replaces the Draft) also clears any
+  // pending edit for that Reel (the old edits no longer apply to the new generated text).
+  const [draftEdits, setDraftEdits] = useState<Record<string, DraftVM>>({});
+  type DraftSavePhase = "idle" | "saving" | "error";
+  const [draftSavePhase, setDraftSavePhase] = useState<DraftSavePhase>("idle");
+  const [draftSaveMsg, setDraftSaveMsg] = useState<string | null>(null);
+  // A ref to the in-app unsaved-edits guard (confirmLeaveDraft), so navigation callbacks declared
+  // EARLIER in this component (openReel etc.) can call the latest closure without a TDZ/order issue.
+  // Kept current by an effect after confirmLeaveDraft is defined. Defaults to a permissive no-guard.
+  const confirmLeaveDraftRef = useRef<() => boolean>(() => true);
 
   // ── Runs ──
   const [runAction, setRunAction] = useState<Action>("full");
@@ -149,6 +197,185 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
     });
   }, []);
 
+  // ── Favorite (user state, ADR-0006) ──
+  // Optimistic overrides keyed by shortcode: a toggle flips local state IMMEDIATELY,
+  // PATCHes in the background, and REVERTS on failure. The server-loaded ReelVM is the
+  // source of truth on first render; an override (once set) wins so the star reflects
+  // the in-flight edit without a server round-trip / page reload.
+  const [favOverrides, setFavOverrides] = useState<Record<string, boolean>>({});
+  const isFavorite = useCallback(
+    (r: ReelVM) => favOverrides[r.shortcode] ?? r.isFavorite,
+    [favOverrides],
+  );
+
+  const toggleFavorite = useCallback(
+    (shortcode: string) => {
+      const base = data.reels.find((r) => r.shortcode === shortcode);
+      if (!base) return;
+      const current = favOverrides[shortcode] ?? base.isFavorite;
+      const next = !current;
+      // Optimistic flip.
+      setFavOverrides((m) => ({ ...m, [shortcode]: next }));
+      void (async () => {
+        try {
+          const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ is_favorite: next }),
+          });
+          if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
+          const updated = (await res.json()) as { is_favorite: boolean };
+          // Reconcile to the server's authoritative state.
+          if (mounted.current) {
+            setFavOverrides((m) => ({ ...m, [shortcode]: updated.is_favorite }));
+          }
+        } catch {
+          // Revert the optimistic flip on failure.
+          if (mounted.current) {
+            setFavOverrides((m) => ({ ...m, [shortcode]: current }));
+          }
+        }
+      })();
+    },
+    [data.reels, favOverrides],
+  );
+
+  // ── Archive (user state, ADR-0006 / slice 967) ──
+  // Mirrors the Favorite optimistic pattern: a toggle flips local state IMMEDIATELY,
+  // PATCHes { is_archived } in the background, and REVERTS on failure. Archived Reels
+  // are hidden by default in the library (archive wins over favorite); the "Show
+  // archived" toggle reveals them. The server-loaded ReelVM is the source of truth on
+  // first render; an override (once set) wins.
+  const [archiveOverrides, setArchiveOverrides] = useState<Record<string, boolean>>({});
+  const isArchived = useCallback(
+    (r: ReelVM) => archiveOverrides[r.shortcode] ?? r.isArchived,
+    [archiveOverrides],
+  );
+
+  const toggleArchive = useCallback(
+    (shortcode: string) => {
+      const base = data.reels.find((r) => r.shortcode === shortcode);
+      if (!base) return;
+      const current = archiveOverrides[shortcode] ?? base.isArchived;
+      const next = !current;
+      // Optimistic flip.
+      setArchiveOverrides((m) => ({ ...m, [shortcode]: next }));
+      void (async () => {
+        try {
+          const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ is_archived: next }),
+          });
+          if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
+          const updated = (await res.json()) as { is_archived: boolean };
+          // Reconcile to the server's authoritative state.
+          if (mounted.current) {
+            setArchiveOverrides((m) => ({ ...m, [shortcode]: updated.is_archived }));
+          }
+        } catch {
+          // Revert the optimistic flip on failure.
+          if (mounted.current) {
+            setArchiveOverrides((m) => ({ ...m, [shortcode]: current }));
+          }
+        }
+      })();
+    },
+    [data.reels, archiveOverrides],
+  );
+
+  // ── Per-post Refresh (MAIN-970) ──
+  // A detail-view action that re-pulls THIS Reel's metrics + Comments and re-mines its FAQs
+  // (the immutable video analysis is left untouched, ADR-0004/0007). It goes through the same
+  // run registry as the batch pipeline (single-writer lock), so we POST then poll the run by
+  // id like the Runs view does; on terminal success we router.refresh() to re-pull the
+  // server-loaded dataset (the page is force-dynamic) so the detail view shows the new
+  // metrics/Comments/FAQs. A concurrent active run returns 409 → surfaced inline.
+  type RefreshPhase = "idle" | "running" | "done" | "error";
+  const [refreshPhase, setRefreshPhase] = useState<RefreshPhase>("idle");
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const stopRefreshPoll = useCallback(() => {
+    if (refreshTimer.current) {
+      clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
+    }
+  }, []);
+
+  const pollRefresh = useCallback(
+    (runId: string) => {
+      const step = async () => {
+        try {
+          const res = await fetch(`/api/content-pipeline/runs/${runId}`, { cache: "no-store" });
+          if (!res.ok) throw new Error(`status check failed (${res.status})`);
+          const rec = (await res.json()) as RunRecord;
+          if (!mounted.current) return;
+          if (rec.status === "succeeded") {
+            stopRefreshPoll();
+            setRefreshPhase("done");
+            setRefreshMsg("Refreshed — metrics, comments & FAQs updated.");
+            // Re-pull the server dataset so the detail view reflects the new state.
+            router.refresh();
+            return;
+          }
+          if (rec.status === "failed") {
+            stopRefreshPoll();
+            setRefreshPhase("error");
+            setRefreshMsg(rec.error ?? "refresh failed");
+            return;
+          }
+          refreshTimer.current = setTimeout(() => void step(), POLL_MS);
+        } catch (e) {
+          if (!mounted.current) return;
+          stopRefreshPoll();
+          setRefreshPhase("error");
+          setRefreshMsg(e instanceof Error ? e.message : String(e));
+        }
+      };
+      void step();
+    },
+    [router, stopRefreshPoll],
+  );
+
+  const refreshDetail = useCallback(
+    (shortcode: string) => {
+      if (refreshPhase === "running") return;
+      setRefreshPhase("running");
+      setRefreshMsg(null);
+      void (async () => {
+        try {
+          const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/refresh`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          if (res.status === 409) {
+            if (mounted.current) {
+              setRefreshPhase("error");
+              setRefreshMsg("a run is already active — wait for it to finish, then retry");
+            }
+            return;
+          }
+          if (res.status === 202) {
+            const { run_id } = (await res.json()) as { run_id: string };
+            if (mounted.current) pollRefresh(run_id);
+            return;
+          }
+          if (mounted.current) {
+            setRefreshPhase("error");
+            setRefreshMsg(`failed to start refresh (${res.status})`);
+          }
+        } catch (e) {
+          if (mounted.current) {
+            setRefreshPhase("error");
+            setRefreshMsg(e instanceof Error ? e.message : String(e));
+          }
+        }
+      })();
+    },
+    [refreshPhase, pollRefresh],
+  );
+
   const reelByShortcode = useMemo(() => {
     const m = new Map<string, ReelVM>();
     for (const r of data.reels) m.set(r.shortcode, r);
@@ -159,18 +386,27 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
 
   const openReel = useCallback(
     (shortcode: string) => {
-      const r = reelByShortcode.get(shortcode);
+      // Guard leaving the current Reel's detail with unsaved Draft edits (MAIN-972).
+      if (!confirmLeaveDraftRef.current()) return;
       setSelected(shortcode);
       setView("detail");
-      setRemixHook(r?.topic ?? "");
-      setRemixCaption(r?.caption ?? "");
-      setCopied(false);
+      // Reset Draft-generation feedback so a prior Reel's "error" never leaks into this one.
+      setDraftPhase("idle");
+      setDraftMsg(null);
+      // Reset Draft-save feedback too.
+      setDraftSavePhase("idle");
+      setDraftSaveMsg(null);
+      // Reset per-post Refresh feedback so a prior Reel's "done"/"error" never leaks in.
+      stopRefreshPoll();
+      setRefreshPhase("idle");
+      setRefreshMsg(null);
       window.scrollTo({ top: 0 });
     },
-    [reelByShortcode],
+    [reelByShortcode, stopRefreshPoll],
   );
 
   const goLibraryForCreator = useCallback((handle: string) => {
+    if (!confirmLeaveDraftRef.current()) return; // guard unsaved Draft edits (MAIN-972)
     setCreatorFilter(handle);
     setRowStyle("signal");
     setSelected(null);
@@ -185,6 +421,11 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
     if (categoryFilter) list = list.filter((r) => r.categorySlug === categoryFilter);
     if (viralOnly) list = list.filter((r) => r.viral);
     if (outlierOnly) list = list.filter((r) => r.outlier);
+    // Archive hidden by default (slice 967). Applied BEFORE favorites so it wins over
+    // favorite: an archived favorite stays hidden unless "Show archived" is on. With
+    // showArchived, archived Reels return and compose with "Favorites only".
+    if (!showArchived) list = list.filter((r) => !isArchived(r));
+    if (favoritesOnly) list = list.filter((r) => isFavorite(r));
     const q = search.trim().toLowerCase();
     if (q) {
       list = list.filter((r) =>
@@ -199,7 +440,7 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
       return (a.categoryLabel ?? "").localeCompare(b.categoryLabel ?? "");
     });
     return list;
-  }, [data.reels, creatorFilter, categoryFilter, viralOnly, outlierOnly, search, sort]);
+  }, [data.reels, creatorFilter, categoryFilter, viralOnly, outlierOnly, favoritesOnly, isFavorite, showArchived, isArchived, search, sort]);
 
   // ── Run polling (the real pipeline API) ──
   const stopPolling = useCallback(() => {
@@ -321,18 +562,236 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
     }
   }, [runAction, runCreator, tick]);
 
-  const copyDraft = useCallback(() => {
-    if (!selectedReel) return;
-    const outline = selectedReel.beats.map((b) => `- ${b.label}: ${b.note}`).join("\n");
-    const text = `HOOK: ${remixHook}\n\nBEATS:\n${outline}\n\nCAPTION: ${remixCaption}`;
-    try {
-      void navigator.clipboard.writeText(text);
-    } catch {
-      /* clipboard blocked */
+  // The persisted Draft for a Reel (the clean baseline): the optimistic override (a just-generated or
+  // just-saved Draft) wins over the server-loaded ReelVM.draft; null when none has been generated yet.
+  const draftFor = useCallback(
+    (r: ReelVM): DraftVM | null => draftOverrides[r.shortcode] ?? r.draft,
+    [draftOverrides],
+  );
+
+  // The Draft to RENDER in the editable fields: the in-progress edit copy if any, else the clean
+  // baseline. Editing seeds draftEdits lazily, so until the user touches a field this returns the
+  // baseline unchanged.
+  const editableDraftFor = useCallback(
+    (r: ReelVM): DraftVM | null => draftEdits[r.shortcode] ?? draftFor(r),
+    [draftEdits, draftFor],
+  );
+
+  // Is this Reel's Draft dirty (unsaved hand-edits)? Only when an edit entry exists AND its content
+  // diverges from the persisted baseline (a structural JSON compare — field-for-field).
+  const isDraftDirty = useCallback(
+    (shortcode: string): boolean => {
+      const edit = draftEdits[shortcode];
+      if (!edit) return false;
+      const base = draftOverrides[shortcode] ?? data.reels.find((r) => r.shortcode === shortcode)?.draft ?? null;
+      if (!base) return true; // editing with no baseline shouldn't happen, but treat as dirty
+      return !draftFieldsEqual(edit, base);
+    },
+    [draftEdits, draftOverrides, data.reels],
+  );
+
+  const anyDraftDirty = useMemo(
+    () => Object.keys(draftEdits).some((sc) => isDraftDirty(sc)),
+    [draftEdits, isDraftDirty],
+  );
+
+  // Update one of the editable Draft fields. Seeds the edit copy from the current baseline on first
+  // touch (so unrelated fields keep their persisted values), then applies the patch.
+  const editDraftField = useCallback(
+    (shortcode: string, patch: (d: DraftVM) => DraftVM) => {
+      setDraftEdits((m) => {
+        const current =
+          m[shortcode] ??
+          draftOverrides[shortcode] ??
+          data.reels.find((r) => r.shortcode === shortcode)?.draft ??
+          null;
+        if (!current) return m; // nothing to edit (no generated Draft)
+        return { ...m, [shortcode]: patch(current) };
+      });
+      // A fresh edit clears any stale save error.
+      setDraftSavePhase("idle");
+      setDraftSaveMsg(null);
+    },
+    [draftOverrides, data.reels],
+  );
+
+  // Discard a Reel's in-progress edits, reverting the fields to the persisted baseline.
+  const revertDraftEdits = useCallback((shortcode: string) => {
+    setDraftEdits((m) => {
+      if (!(shortcode in m)) return m;
+      const next = { ...m };
+      delete next[shortcode];
+      return next;
+    });
+    setDraftSavePhase("idle");
+    setDraftSaveMsg(null);
+  }, []);
+
+  // SAVE a Reel's hand-edits (MAIN-972). PUTs the editable fields to the standalone read-write route;
+  // on success stamps the returned Draft as the new baseline override AND clears the edit entry (clean
+  // again). Edits survive reloads + sessions because they're now in the Content Store. Mirrors the
+  // generate flow's fetch + override stamping; the dirty indicator + Save button live in the detail view.
+  const saveDraftForReel = useCallback(
+    (shortcode: string) => {
+      if (draftSavePhase === "saving") return;
+      const edit = draftEdits[shortcode];
+      if (!edit) return; // nothing to save
+      setDraftSavePhase("saving");
+      setDraftSaveMsg(null);
+      void (async () => {
+        try {
+          const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/draft`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hooks: edit.hooks,
+              beat_scripts: edit.beatScripts.map((b) => ({ label: b.label, script: b.script })),
+              reasoning: edit.reasoning,
+              caption: edit.caption,
+            }),
+          });
+          if (!res.ok) {
+            const body = (await res.json().catch(() => ({}))) as { error?: string };
+            throw new Error(body.error ?? `save failed (${res.status})`);
+          }
+          const d = (await res.json()) as {
+            hooks: { text: string; suggested: boolean }[];
+            beat_scripts: { label: string; script: string }[];
+            reasoning: string;
+            caption: string;
+            generated_at: string;
+            updated_at: string;
+          };
+          if (!mounted.current) return;
+          // The server-validated Draft becomes the new clean baseline; drop the edit entry.
+          setDraftOverrides((m) => ({
+            ...m,
+            [shortcode]: {
+              hooks: d.hooks,
+              beatScripts: d.beat_scripts,
+              reasoning: d.reasoning,
+              caption: d.caption,
+              generatedAt: d.generated_at,
+              updatedAt: d.updated_at,
+            },
+          }));
+          setDraftEdits((m) => {
+            const next = { ...m };
+            delete next[shortcode];
+            return next;
+          });
+          setDraftSavePhase("idle");
+        } catch (e) {
+          if (mounted.current) {
+            setDraftSavePhase("error");
+            setDraftSaveMsg(e instanceof Error ? e.message : String(e));
+          }
+        }
+      })();
+    },
+    [draftEdits, draftSavePhase],
+  );
+
+  // Generate (or REGENERATE) this Reel's Draft. Regenerate is a destructive full-replace, so the
+  // confirm is gated HERE before the POST. On success we stamp the returned Draft into the
+  // optimistic overrides so the detail view re-renders without a page reload (slice 972 adds edit).
+  const generateDraftForReel = useCallback(
+    (shortcode: string, isRegenerate: boolean) => {
+      if (draftPhase === "generating") return;
+      if (
+        isRegenerate &&
+        !window.confirm(
+          "Regenerate this draft? This replaces all generated fields — including the caption — and can't be undone.",
+        )
+      ) {
+        return;
+      }
+      setDraftPhase("generating");
+      setDraftMsg(null);
+      void (async () => {
+        try {
+          const res = await fetch(`/api/reels/${encodeURIComponent(shortcode)}/draft`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          if (!res.ok) {
+            const body = (await res.json().catch(() => ({}))) as { error?: string };
+            throw new Error(body.error ?? `draft generation failed (${res.status})`);
+          }
+          const d = (await res.json()) as {
+            hooks: { text: string; suggested: boolean }[];
+            beat_scripts: { label: string; script: string }[];
+            reasoning: string;
+            caption: string;
+            generated_at: string;
+            updated_at: string;
+          };
+          if (!mounted.current) return;
+          setDraftOverrides((m) => ({
+            ...m,
+            [shortcode]: {
+              hooks: d.hooks,
+              beatScripts: d.beat_scripts,
+              reasoning: d.reasoning,
+              caption: d.caption,
+              generatedAt: d.generated_at,
+              updatedAt: d.updated_at,
+            },
+          }));
+          // A regenerate full-replaces the Draft, so any pending hand-edits no longer apply —
+          // drop them (the editable fields re-seed from the new generated text).
+          setDraftEdits((m) => {
+            if (!(shortcode in m)) return m;
+            const next = { ...m };
+            delete next[shortcode];
+            return next;
+          });
+          setDraftSavePhase("idle");
+          setDraftSaveMsg(null);
+          setDraftPhase("idle");
+        } catch (e) {
+          if (mounted.current) {
+            setDraftPhase("error");
+            setDraftMsg(e instanceof Error ? e.message : String(e));
+          }
+        }
+      })();
+    },
+    [draftPhase],
+  );
+
+  // In-app navigation guard (MAIN-972, acceptance #2): before leaving the CURRENTLY-OPEN Reel's
+  // detail (open another Reel, Back, switch view), if its Draft has unsaved hand-edits, prompt. On
+  // confirm, DISCARD that Reel's edits so we don't carry a stale dirty entry forward; on cancel,
+  // return false so the caller aborts the navigation. Returns true when there's nothing to guard.
+  // (Real browser unload/reload is covered separately by the beforeunload effect above.)
+  const confirmLeaveDraft = useCallback((): boolean => {
+    if (!selected || !isDraftDirty(selected)) return true;
+    if (window.confirm("You have unsaved changes to this draft. Leave without saving?")) {
+      revertDraftEdits(selected);
+      return true;
     }
-    setCopied(true);
-    setTimeout(() => mounted.current && setCopied(false), 1600);
-  }, [selectedReel, remixHook, remixCaption]);
+    return false;
+  }, [selected, isDraftDirty, revertDraftEdits]);
+
+  // Keep the ref pointed at the latest guard so order-earlier navigation callbacks see it.
+  useEffect(() => {
+    confirmLeaveDraftRef.current = confirmLeaveDraft;
+  }, [confirmLeaveDraft]);
+
+  // Warn on a real browser navigation/reload/close while a Draft has unsaved hand-edits (MAIN-972,
+  // acceptance #2). The native beforeunload prompt is the browser's own confirm — preventDefault +
+  // returnValue is the cross-browser incantation. In-app navigation (open another Reel / Back / switch
+  // view) is guarded separately by confirmLeaveDraft. Re-subscribes only when dirtiness flips.
+  useEffect(() => {
+    if (!anyDraftDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = ""; // required for Chrome to show the prompt
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [anyDraftDirty]);
 
   return (
     <div style={S.app}>
@@ -344,6 +803,7 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
         themeLabel={theme === "light" ? "Dark mode" : "Light mode"}
         onToggleTheme={toggleTheme}
         onGo={(v) => {
+          if (!confirmLeaveDraft()) return; // guard unsaved Draft edits (MAIN-972)
           setSelected(null);
           setView(v);
           window.scrollTo({ top: 0 });
@@ -365,24 +825,46 @@ export function AppShell({ data, initialView = "library", initialCreator = null 
             setViralOnly={setViralOnly}
             outlierOnly={outlierOnly}
             setOutlierOnly={setOutlierOnly}
+            favoritesOnly={favoritesOnly}
+            setFavoritesOnly={setFavoritesOnly}
+            showArchived={showArchived}
+            setShowArchived={setShowArchived}
             categoryFilter={categoryFilter}
             setCategoryFilter={setCategoryFilter}
             creatorFilter={creatorFilter}
             clearCreator={() => setCreatorFilter(null)}
             onOpen={openReel}
+            isFavorite={isFavorite}
+            onToggleFavorite={toggleFavorite}
+            isArchived={isArchived}
+            onToggleArchive={toggleArchive}
           />
         )}
 
         {view === "detail" && selectedReel && (
           <DetailView
             reel={selectedReel}
-            remixHook={remixHook}
-            remixCaption={remixCaption}
-            copied={copied}
-            onHook={setRemixHook}
-            onCaption={setRemixCaption}
-            onCopy={copyDraft}
+            favorite={isFavorite(selectedReel)}
+            onToggleFavorite={() => toggleFavorite(selectedReel.shortcode)}
+            archived={isArchived(selectedReel)}
+            onToggleArchive={() => toggleArchive(selectedReel.shortcode)}
+            refreshPhase={refreshPhase}
+            refreshMsg={refreshMsg}
+            onRefresh={() => refreshDetail(selectedReel.shortcode)}
+            draft={editableDraftFor(selectedReel)}
+            draftDirty={isDraftDirty(selectedReel.shortcode)}
+            draftPhase={draftPhase}
+            draftMsg={draftMsg}
+            draftSavePhase={draftSavePhase}
+            draftSaveMsg={draftSaveMsg}
+            onGenerateDraft={(isRegenerate) =>
+              generateDraftForReel(selectedReel.shortcode, isRegenerate)
+            }
+            onEditDraft={(patch) => editDraftField(selectedReel.shortcode, patch)}
+            onSaveDraft={() => saveDraftForReel(selectedReel.shortcode)}
+            onRevertDraft={() => revertDraftEdits(selectedReel.shortcode)}
             onBack={() => {
+              if (!confirmLeaveDraft()) return; // guard unsaved Draft edits (MAIN-972)
               setView("library");
               setSelected(null);
             }}
@@ -515,11 +997,19 @@ function LibraryView(props: {
   setViralOnly: (b: boolean) => void;
   outlierOnly: boolean;
   setOutlierOnly: (b: boolean) => void;
+  favoritesOnly: boolean;
+  setFavoritesOnly: (b: boolean) => void;
+  showArchived: boolean;
+  setShowArchived: (b: boolean) => void;
   categoryFilter: string | null;
   setCategoryFilter: (s: string | null) => void;
   creatorFilter: string | null;
   clearCreator: () => void;
   onOpen: (shortcode: string) => void;
+  isFavorite: (r: ReelVM) => boolean;
+  onToggleFavorite: (s: string) => void;
+  isArchived: (r: ReelVM) => boolean;
+  onToggleArchive: (s: string) => void;
 }) {
   const {
     data,
@@ -534,11 +1024,19 @@ function LibraryView(props: {
     setViralOnly,
     outlierOnly,
     setOutlierOnly,
+    favoritesOnly,
+    setFavoritesOnly,
+    showArchived,
+    setShowArchived,
     categoryFilter,
     setCategoryFilter,
     creatorFilter,
     clearCreator,
     onOpen,
+    isFavorite,
+    onToggleFavorite,
+    isArchived,
+    onToggleArchive,
   } = props;
 
   const subtitle =
@@ -583,6 +1081,12 @@ function LibraryView(props: {
           <button onClick={() => setOutlierOnly(!outlierOnly)} style={pillStyle(outlierOnly)}>
             Outliers
           </button>
+          <button onClick={() => setFavoritesOnly(!favoritesOnly)} style={pillStyle(favoritesOnly)}>
+            Favorites only
+          </button>
+          <button onClick={() => setShowArchived(!showArchived)} style={pillStyle(showArchived)}>
+            Show archived
+          </button>
         </div>
         {creatorFilter && (
           <button onClick={clearCreator} style={S.creatorChip}>
@@ -620,11 +1124,11 @@ function LibraryView(props: {
       {reels.length === 0 ? (
         <div style={S.empty}>No Reels match these filters.</div>
       ) : rowStyle === "signal" ? (
-        <SignalRows reels={reels} onOpen={onOpen} />
+        <SignalRows reels={reels} onOpen={onOpen} isFavorite={isFavorite} onToggleFavorite={onToggleFavorite} isArchived={isArchived} onToggleArchive={onToggleArchive} />
       ) : rowStyle === "table" ? (
-        <CommandTable reels={reels} onOpen={onOpen} />
+        <CommandTable reels={reels} onOpen={onOpen} isFavorite={isFavorite} onToggleFavorite={onToggleFavorite} isArchived={isArchived} onToggleArchive={onToggleArchive} />
       ) : (
-        <GalleryGrid reels={reels} onOpen={onOpen} />
+        <GalleryGrid reels={reels} onOpen={onOpen} isFavorite={isFavorite} onToggleFavorite={onToggleFavorite} isArchived={isArchived} onToggleArchive={onToggleArchive} />
       )}
     </section>
   );
@@ -672,13 +1176,97 @@ function Flag({ kind }: { kind: "viral" | "outlier" }) {
   );
 }
 
-function SignalRows({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) => void }) {
+/**
+ * Favorite star toggle (ADR-0006 / MAIN-965). Filled accent star when favorited,
+ * faint outline otherwise. stopPropagation so clicking the star inside a clickable
+ * library row/card never also opens the Reel detail. The optimistic flip + PATCH
+ * lives in AppShell.toggleFavorite; this is purely presentational.
+ */
+function StarToggle({ favorite, onToggle, size = 17 }: { favorite: boolean; onToggle: () => void; size?: number }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={favorite}
+      aria-label={favorite ? "Unfavorite" : "Favorite"}
+      title={favorite ? "Unfavorite" : "Favorite"}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      className="mc-press"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "none",
+        border: "none",
+        padding: 4,
+        margin: -4,
+        cursor: "pointer",
+        flex: "none",
+        lineHeight: 0,
+      }}
+    >
+      <Icon
+        name="star"
+        size={size}
+        stroke={favorite ? "var(--accent)" : "var(--fg-faint)"}
+        fill={favorite ? "var(--accent)" : "none"}
+        sw={1.8}
+      />
+    </button>
+  );
+}
+
+/**
+ * Archive toggle (ADR-0006 / slice 967). A box icon, accent when archived. Like
+ * StarToggle it stopPropagation's so clicking it inside a clickable library row/card
+ * never also opens the Reel detail. The optimistic flip + PATCH lives in
+ * AppShell.toggleArchive; this is purely presentational.
+ */
+function ArchiveToggle({ archived, onToggle, size = 16 }: { archived: boolean; onToggle: () => void; size?: number }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={archived}
+      aria-label={archived ? "Unarchive" : "Archive"}
+      title={archived ? "Unarchive" : "Archive"}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      className="mc-press"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "none",
+        border: "none",
+        padding: 4,
+        margin: -4,
+        cursor: "pointer",
+        flex: "none",
+        lineHeight: 0,
+      }}
+    >
+      <Icon
+        name="archive"
+        size={size}
+        stroke={archived ? "var(--accent)" : "var(--fg-faint)"}
+        fill={archived ? "var(--accent)" : "none"}
+        sw={1.8}
+      />
+    </button>
+  );
+}
+
+function SignalRows({ reels, onOpen, isFavorite, onToggleFavorite, isArchived, onToggleArchive }: { reels: ReelVM[]; onOpen: (s: string) => void; isFavorite: (r: ReelVM) => boolean; onToggleFavorite: (s: string) => void; isArchived: (r: ReelVM) => boolean; onToggleArchive: (s: string) => void }) {
   return (
     <div>
       {reels.map((r) => {
         const dur = formatDuration(r.durationSec);
         return (
-          <div key={r.shortcode} className="mc-row" onClick={() => onOpen(r.shortcode)} style={S.signalRow}>
+          <div key={r.shortcode} className="mc-row" onClick={() => onOpen(r.shortcode)} style={{ ...S.signalRow, opacity: isArchived(r) ? 0.62 : 1 }}>
             <div style={{ position: "relative", flex: "none" }}>
               <div style={thumb(r.thumbUrl, { width: 48, height: 64, borderRadius: 2 })} />
               {dur && <div style={S.durBadge}>{dur}</div>}
@@ -688,6 +1276,7 @@ function SignalRows({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) =>
                 <span style={S.signalTopic}>{r.topic ?? "—"}</span>
                 {r.viral && <Flag kind="viral" />}
                 {r.outlier && <Flag kind="outlier" />}
+                {isArchived(r) && <ArchivedTag />}
               </div>
               <div style={S.signalCaption}>{r.caption ?? ""}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 9 }}>
@@ -710,12 +1299,33 @@ function SignalRows({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) =>
                   {r.topComments.length}
                 </span>
               </div>
+              <StarToggle favorite={isFavorite(r)} onToggle={() => onToggleFavorite(r.shortcode)} />
+              <ArchiveToggle archived={isArchived(r)} onToggle={() => onToggleArchive(r.shortcode)} />
               <Icon name="chevron" size={16} stroke="var(--border)" sw={2} />
             </div>
           </div>
         );
       })}
     </div>
+  );
+}
+
+/** A faint "Archived" pill so an archived Reel reads as archived when "Show archived" reveals it. */
+function ArchivedTag() {
+  return (
+    <span
+      style={{
+        ...micro(9),
+        letterSpacing: "0.1em",
+        padding: "2px 6px",
+        borderRadius: 999,
+        flex: "none",
+        color: "var(--fg-muted)",
+        background: "var(--bg-deep)",
+      }}
+    >
+      ARCHIVED
+    </span>
   );
 }
 
@@ -738,7 +1348,7 @@ function Metric({ label, value, accent, muted }: { label: string; value: string;
   );
 }
 
-function CommandTable({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) => void }) {
+function CommandTable({ reels, onOpen, isFavorite, onToggleFavorite, isArchived, onToggleArchive }: { reels: ReelVM[]; onOpen: (s: string) => void; isFavorite: (r: ReelVM) => boolean; onToggleFavorite: (s: string) => void; isArchived: (r: ReelVM) => boolean; onToggleArchive: (s: string) => void }) {
   const grid = "1.6fr 0.7fr 0.8fr 64px 64px 56px 64px 56px";
   const th = (text: string, right?: boolean): CSSProperties => ({ ...micro(9), textAlign: right ? "right" : "left" });
   return (
@@ -761,9 +1371,11 @@ function CommandTable({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) 
             key={r.shortcode}
             className="mc-row"
             onClick={() => onOpen(r.shortcode)}
-            style={{ display: "grid", gridTemplateColumns: grid, alignItems: "center", padding: "10px 0", borderBottom: "1px solid var(--border-faint)", cursor: "pointer" }}
+            style={{ display: "grid", gridTemplateColumns: grid, alignItems: "center", padding: "10px 0", borderBottom: "1px solid var(--border-faint)", cursor: "pointer", opacity: isArchived(r) ? 0.62 : 1 }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, paddingRight: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, paddingRight: 12 }}>
+              <StarToggle favorite={isFavorite(r)} onToggle={() => onToggleFavorite(r.shortcode)} size={15} />
+              <ArchiveToggle archived={isArchived(r)} onToggle={() => onToggleArchive(r.shortcode)} size={14} />
               <div style={thumb(r.thumbUrl, { width: 26, height: 34, borderRadius: 2 })} />
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 13.5, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -790,11 +1402,11 @@ function CommandTable({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) 
   );
 }
 
-function GalleryGrid({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) => void }) {
+function GalleryGrid({ reels, onOpen, isFavorite, onToggleFavorite, isArchived, onToggleArchive }: { reels: ReelVM[]; onOpen: (s: string) => void; isFavorite: (r: ReelVM) => boolean; onToggleFavorite: (s: string) => void; isArchived: (r: ReelVM) => boolean; onToggleArchive: (s: string) => void }) {
   return (
     <div style={S.gallery}>
       {reels.map((r) => (
-        <div key={r.shortcode} className="mc-card" onClick={() => onOpen(r.shortcode)} style={S.galleryCard}>
+        <div key={r.shortcode} className="mc-card" onClick={() => onOpen(r.shortcode)} style={{ ...S.galleryCard, opacity: isArchived(r) ? 0.62 : 1 }}>
           <div style={{ position: "relative", aspectRatio: "9 / 13", background: "var(--bg-deep)" }}>
             <div style={thumb(r.thumbUrl, { width: "100%", height: "100%" })} />
             <div style={{ position: "absolute", top: 8, left: 8, display: "flex", gap: 5 }}>
@@ -804,6 +1416,34 @@ function GalleryGrid({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) =
                   OUTLIER
                 </span>
               )}
+            </div>
+            <div style={{ position: "absolute", top: 6, right: 6, display: "flex", gap: 5 }}>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: 26,
+                  height: 26,
+                  borderRadius: 999,
+                  background: "rgba(0,0,0,0.45)",
+                }}
+              >
+                <StarToggle favorite={isFavorite(r)} onToggle={() => onToggleFavorite(r.shortcode)} size={15} />
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: 26,
+                  height: 26,
+                  borderRadius: 999,
+                  background: "rgba(0,0,0,0.45)",
+                }}
+              >
+                <ArchiveToggle archived={isArchived(r)} onToggle={() => onToggleArchive(r.shortcode)} size={14} />
+              </div>
             </div>
             <div style={S.galleryBeatGrad}>
               <BeatBars beats={r.beats} height={6} />
@@ -831,21 +1471,48 @@ function GalleryGrid({ reels, onOpen }: { reels: ReelVM[]; onOpen: (s: string) =
 
 function DetailView({
   reel,
-  remixHook,
-  remixCaption,
-  copied,
-  onHook,
-  onCaption,
-  onCopy,
+  favorite,
+  onToggleFavorite,
+  archived,
+  onToggleArchive,
+  refreshPhase,
+  refreshMsg,
+  onRefresh,
+  draft,
+  draftDirty,
+  draftPhase,
+  draftMsg,
+  draftSavePhase,
+  draftSaveMsg,
+  onGenerateDraft,
+  onEditDraft,
+  onSaveDraft,
+  onRevertDraft,
   onBack,
 }: {
   reel: ReelVM;
-  remixHook: string;
-  remixCaption: string;
-  copied: boolean;
-  onHook: (s: string) => void;
-  onCaption: (s: string) => void;
-  onCopy: () => void;
+  favorite: boolean;
+  onToggleFavorite: () => void;
+  archived: boolean;
+  onToggleArchive: () => void;
+  refreshPhase: "idle" | "running" | "done" | "error";
+  refreshMsg: string | null;
+  onRefresh: () => void;
+  /** The Draft to render in the editable fields (the in-progress edit copy, else the persisted baseline). */
+  draft: DraftVM | null;
+  /** True when the Draft has unsaved hand-edits (MAIN-972) — drives the dirty indicator + Save enable. */
+  draftDirty: boolean;
+  draftPhase: "idle" | "generating" | "error";
+  draftMsg: string | null;
+  draftSavePhase: "idle" | "saving" | "error";
+  draftSaveMsg: string | null;
+  onGenerateDraft: (isRegenerate: boolean) => void;
+  /** Apply an edit to the rendered Draft (seeds the edit copy on first touch). */
+  onEditDraft: (patch: (d: DraftVM) => DraftVM) => void;
+  /** Persist the hand-edits (PUT /api/reels/{shortcode}/draft). */
+  onSaveDraft: () => void;
+  /** Discard the in-progress edits, reverting fields to the persisted baseline. */
+  onRevertDraft: () => void;
   onBack: () => void;
 }) {
   const questions = reel.topComments.filter((c) => c.isQuestion);
@@ -860,10 +1527,89 @@ function DetailView({
           <Icon name="back" size={14} stroke="currentColor" sw={2} /> Library
         </button>
         <span style={{ ...micro(10), letterSpacing: "0.12em" }}>{reel.shortcode}</span>
+        <button
+          onClick={onToggleFavorite}
+          aria-pressed={favorite}
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            border: favorite ? "1px solid var(--accent)" : "1px solid var(--border)",
+            background: favorite ? "var(--warning)" : "var(--bg-elevated)",
+            color: favorite ? "var(--accent)" : "var(--fg-muted)",
+            borderRadius: 2,
+            padding: "7px 12px",
+            fontSize: 12,
+            cursor: "pointer",
+          }}
+          className="mc-press"
+        >
+          <Icon name="star" size={14} stroke={favorite ? "var(--accent)" : "currentColor"} fill={favorite ? "var(--accent)" : "none"} sw={1.8} />
+          {favorite ? "Favorited" : "Favorite"}
+        </button>
+        <button
+          onClick={onToggleArchive}
+          aria-pressed={archived}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            border: archived ? "1px solid var(--accent)" : "1px solid var(--border)",
+            background: archived ? "var(--warning)" : "var(--bg-elevated)",
+            color: archived ? "var(--accent)" : "var(--fg-muted)",
+            borderRadius: 2,
+            padding: "7px 12px",
+            fontSize: 12,
+            cursor: "pointer",
+          }}
+          className="mc-press"
+        >
+          <Icon name="archive" size={14} stroke={archived ? "var(--accent)" : "currentColor"} fill={archived ? "var(--accent)" : "none"} sw={1.8} />
+          {archived ? "Archived" : "Archive"}
+        </button>
+        {/* Per-post Refresh (MAIN-970): re-pulls metrics + Comments and re-mines FAQs for THIS
+            Reel (the immutable analysis is left untouched). Disabled while in flight. */}
+        <button
+          onClick={onRefresh}
+          disabled={refreshPhase === "running"}
+          title="Re-pull metrics + comments and re-mine FAQs for this Reel"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            border: "1px solid var(--border)",
+            background: "var(--bg-elevated)",
+            color: "var(--fg-muted)",
+            borderRadius: 2,
+            padding: "7px 12px",
+            fontSize: 12,
+            cursor: refreshPhase === "running" ? "default" : "pointer",
+            opacity: refreshPhase === "running" ? 0.65 : 1,
+          }}
+          className="mc-press"
+        >
+          <Icon name="arrow" size={14} stroke="currentColor" sw={1.8} />
+          {refreshPhase === "running" ? "Refreshing…" : "Refresh"}
+        </button>
         <a href={reel.url} target="_blank" rel="noopener noreferrer" style={S.igLink} className="mc-press">
           Open on Instagram <span style={{ fontSize: 13 }}>↗</span>
         </a>
       </div>
+
+      {/* Per-post Refresh feedback line — only rendered when there's something to say. */}
+      {refreshMsg && (
+        <div
+          role="status"
+          style={{
+            margin: "0 0 6px",
+            fontSize: 12,
+            color: refreshPhase === "error" ? "var(--error-fg)" : "var(--fg-muted)",
+          }}
+        >
+          {refreshMsg}
+        </div>
+      )}
 
       <div style={S.detailBody}>
         {/* left rail */}
@@ -982,6 +1728,55 @@ function DetailView({
             </div>
           )}
 
+          {/* TRIGGER KEYWORD — the ManyChat CTA word + how many Comments responded to it.
+              A CTA-response signal; those trigger Comments are EXCLUDED from the list below. */}
+          {reel.triggerKeyword && (
+            <div style={{ marginTop: 28 }}>
+              <SectionHead title="Trigger keyword" meta="ManyChat CTA" />
+              <div
+                style={{
+                  ...S.panel,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 14,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 15,
+                    letterSpacing: "0.04em",
+                    color: "var(--accent)",
+                    padding: "5px 12px",
+                    borderRadius: 999,
+                    background: "var(--bg-deep)",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {reel.triggerKeyword}
+                </span>
+                <span style={{ fontSize: 13, color: "var(--fg-muted)" }}>
+                  {fmt(reel.triggerCommentCount)} comment
+                  {reel.triggerCommentCount === 1 ? "" : "s"} fired this automation
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* FAQs — questions mined from non-trigger Comments, ranked by strength; each
+              expandable to its real example Comments (MAIN-969). */}
+          {reel.faqs.length > 0 && (
+            <div style={{ marginTop: 28 }}>
+              <SectionHead title="FAQs" meta={`${reel.faqs.length} mined · ranked by demand`} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {reel.faqs.map((f, i) => (
+                  <FaqItem key={i} faq={f} />
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* COMMENTS */}
           {commentsToShow.length > 0 && (
             <div style={{ marginTop: 28 }}>
@@ -1010,42 +1805,281 @@ function DetailView({
             </div>
           )}
 
-          {/* YOUR VERSION */}
+          {/* YOUR VERSION — the user's GENERATED + EDITABLE, PERSISTED Draft (MAIN-971/972). Generate
+              when none exists; Regenerate (confirmed destructive full-replace) otherwise. Every field
+              (3 hooks + suggested flag, per-beat scripts, reasoning, caption) is hand-editable; Save
+              PUTs the edits (survives reload + session). An unsaved-changes indicator + confirm-on-leave
+              guard the dirty state. */}
           <div style={{ marginTop: 30 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 13 }}>
               <h2 style={{ margin: 0, fontWeight: 500, fontSize: 16 }}>Your version</h2>
-              <span style={{ ...micro(10), letterSpacing: "0.1em" }}>Editable draft</span>
-            </div>
-            <div style={{ border: "1px solid var(--accent)", borderRadius: 2, overflow: "hidden" }}>
-              <div style={{ background: "var(--warning)", padding: "11px 18px", display: "flex", alignItems: "center", gap: 9 }}>
-                <Icon name="sparkle" size={14} stroke="var(--accent)" sw={2} />
-                <span style={{ fontSize: 12.5, color: "var(--fg)" }}>Seeded from this Reel. Edit any field; drafts stay local to this session.</span>
-              </div>
-              <div style={{ background: "var(--bg-elevated)", padding: 20 }}>
-                <div style={{ ...micro(9), letterSpacing: "0.14em", marginBottom: 7 }}>Hook · first 3 seconds</div>
-                <input value={remixHook} onChange={(e) => onHook(e.target.value)} style={S.remixInput} />
-                {reel.beats.length > 0 && (
-                  <>
-                    <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "18px 0 9px" }}>Beat outline</div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                      {reel.beats.map((b, i) => (
-                        <div key={`${b.label}-${i}`} style={{ display: "flex", alignItems: "flex-start", gap: 11 }}>
-                          <span style={S.beatTag}>{b.label}</span>
-                          <span style={{ fontSize: 13.5, color: "var(--fg)", lineHeight: 1.5 }}>{b.note}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </>
-                )}
-                <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "18px 0 9px" }}>Caption draft</div>
-                <textarea value={remixCaption} onChange={(e) => onCaption(e.target.value)} rows={3} style={S.remixTextarea} />
-                <div style={{ display: "flex", gap: 9, marginTop: 16, alignItems: "center" }}>
-                  <button onClick={onCopy} style={S.copyBtn} className="mc-press">
-                    {copied ? "Copied" : "Copy draft"}
+              <span style={{ ...micro(10), letterSpacing: "0.1em" }}>
+                {draft ? "Editable draft" : "Not generated yet"}
+              </span>
+              {/* Unsaved-changes indicator (MAIN-972). */}
+              {draft && draftDirty && (
+                <span style={{ ...micro(9), letterSpacing: "0.08em", color: "var(--accent)", display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: 999, background: "var(--accent)", display: "inline-block" }} />
+                  Unsaved changes
+                </span>
+              )}
+              {/* Save + Discard appear once there are edits to persist (MAIN-972). */}
+              {draft && draftDirty && (
+                <>
+                  <button
+                    onClick={onSaveDraft}
+                    disabled={draftSavePhase === "saving"}
+                    style={{
+                      marginLeft: "auto",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      border: "1px solid var(--accent)",
+                      background: "var(--accent)",
+                      color: "var(--bg)",
+                      borderRadius: 2,
+                      padding: "7px 13px",
+                      fontSize: 12.5,
+                      fontWeight: 500,
+                      cursor: draftSavePhase === "saving" ? "default" : "pointer",
+                      opacity: draftSavePhase === "saving" ? 0.65 : 1,
+                    }}
+                    className="mc-press"
+                  >
+                    {draftSavePhase === "saving" ? "Saving…" : "Save"}
                   </button>
+                  <button
+                    onClick={onRevertDraft}
+                    disabled={draftSavePhase === "saving"}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      border: "1px solid var(--border)",
+                      background: "var(--bg-elevated)",
+                      color: "var(--fg-muted)",
+                      borderRadius: 2,
+                      padding: "7px 13px",
+                      fontSize: 12.5,
+                      cursor: draftSavePhase === "saving" ? "default" : "pointer",
+                    }}
+                    className="mc-press"
+                  >
+                    Discard
+                  </button>
+                </>
+              )}
+              <button
+                onClick={() => onGenerateDraft(draft != null)}
+                disabled={draftPhase === "generating"}
+                style={{
+                  marginLeft: draft && draftDirty ? undefined : "auto",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  border: "1px solid var(--accent)",
+                  background: draft ? "var(--bg-elevated)" : "var(--accent)",
+                  color: draft ? "var(--accent)" : "var(--bg)",
+                  borderRadius: 2,
+                  padding: "7px 13px",
+                  fontSize: 12.5,
+                  fontWeight: 500,
+                  cursor: draftPhase === "generating" ? "default" : "pointer",
+                  opacity: draftPhase === "generating" ? 0.65 : 1,
+                }}
+                className="mc-press"
+              >
+                <Icon name="sparkle" size={14} stroke={draft ? "var(--accent)" : "var(--bg)"} sw={2} />
+                {draftPhase === "generating"
+                  ? "Generating…"
+                  : draft
+                    ? "Regenerate"
+                    : "Generate"}
+              </button>
+            </div>
+
+            {/* Feedback line — generation error or save error. */}
+            {(draftMsg || draftSaveMsg) && (
+              <div role="status" style={{ margin: "0 0 8px", fontSize: 12, color: "var(--error-fg)" }}>
+                {draftMsg ?? draftSaveMsg}
+              </div>
+            )}
+
+            {!draft ? (
+              <div style={{ ...S.panel, color: "var(--fg-muted)", fontSize: 13.5, lineHeight: 1.6 }}>
+                Generate your own version of this Reel — three hook options, a per-beat talking-points
+                script, the questions to answer from the comments, and a caption — seeded from this
+                Reel&apos;s analysis and its audience FAQs. Then edit any field and Save.
+              </div>
+            ) : (
+              <div style={{ border: "1px solid var(--accent)", borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ background: "var(--warning)", padding: "11px 18px", display: "flex", alignItems: "center", gap: 9 }}>
+                  <Icon name="sparkle" size={14} stroke="var(--accent)" sw={2} />
+                  <span style={{ fontSize: 12.5, color: "var(--fg)" }}>
+                    Seeded from this Reel&apos;s analysis and audience FAQs — edit any field and Save. Regenerate fully replaces it.
+                  </span>
+                </div>
+                <div style={{ background: "var(--bg-elevated)", padding: 20 }}>
+                  {/* HOOKS — 3 EDITABLE options; the radio picks the one "suggested". */}
+                  <div style={{ ...micro(9), letterSpacing: "0.14em", marginBottom: 9 }}>Hook options</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+                    {draft.hooks.map((h, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          display: "flex",
+                          alignItems: "flex-start",
+                          gap: 11,
+                          border: h.suggested ? "1px solid var(--accent)" : "1px solid var(--border-faint)",
+                          background: h.suggested ? "var(--warning)" : "var(--bg)",
+                          borderRadius: 2,
+                          padding: "11px 13px",
+                        }}
+                      >
+                        <span style={{ ...micro(9), letterSpacing: "0.08em", color: "var(--fg-faint)", flex: "none", marginTop: 7 }}>
+                          {String.fromCharCode(65 + i)}
+                        </span>
+                        <textarea
+                          aria-label={`Hook option ${String.fromCharCode(65 + i)}`}
+                          value={h.text}
+                          rows={2}
+                          onChange={(e) => {
+                            const text = e.target.value;
+                            onEditDraft((d) => ({
+                              ...d,
+                              hooks: d.hooks.map((hk, j) => (j === i ? { ...hk, text } : hk)),
+                            }));
+                          }}
+                          style={{
+                            flex: 1,
+                            fontSize: 14.5,
+                            fontWeight: 500,
+                            color: "var(--fg)",
+                            lineHeight: 1.4,
+                            background: "transparent",
+                            border: "none",
+                            outline: "none",
+                            resize: "vertical",
+                            fontFamily: "inherit",
+                          }}
+                        />
+                        <label style={{ ...micro(9), letterSpacing: "0.08em", color: h.suggested ? "var(--accent)" : "var(--fg-faint)", flex: "none", marginTop: 5, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+                          <input
+                            type="radio"
+                            name="draft-suggested-hook"
+                            checked={h.suggested}
+                            aria-label={`Mark hook ${String.fromCharCode(65 + i)} as suggested`}
+                            onChange={() =>
+                              onEditDraft((d) => ({
+                                ...d,
+                                hooks: d.hooks.map((hk, j) => ({ ...hk, suggested: j === i })),
+                              }))
+                            }
+                            style={{ accentColor: "var(--accent)", cursor: "pointer" }}
+                          />
+                          Suggested
+                        </label>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* PER-BEAT SCRIPTS — EDITABLE; labels are fixed (aligned to the analyzed beats). Empty
+                      when the Reel has no analyzed beats. */}
+                  {draft.beatScripts.length > 0 && (
+                    <>
+                      <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "20px 0 9px" }}>Per-beat script</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                        {draft.beatScripts.map((b, i) => (
+                          <div key={`${b.label}-${i}`} style={{ display: "flex", alignItems: "flex-start", gap: 11 }}>
+                            <span style={S.beatTag}>{b.label}</span>
+                            <textarea
+                              aria-label={`Script for beat ${b.label}`}
+                              value={b.script}
+                              rows={2}
+                              placeholder="—"
+                              onChange={(e) => {
+                                const script = e.target.value;
+                                onEditDraft((d) => ({
+                                  ...d,
+                                  beatScripts: d.beatScripts.map((bs, j) => (j === i ? { ...bs, script } : bs)),
+                                }));
+                              }}
+                              style={{
+                                flex: 1,
+                                fontSize: 13.5,
+                                color: "var(--fg)",
+                                lineHeight: 1.55,
+                                background: "var(--bg)",
+                                border: "1px solid var(--border-faint)",
+                                borderRadius: 2,
+                                padding: "8px 10px",
+                                outline: "none",
+                                resize: "vertical",
+                                fontFamily: "inherit",
+                              }}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {/* REASONING — EDITABLE. */}
+                  <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "20px 0 9px" }}>Why this version</div>
+                  <textarea
+                    aria-label="Reasoning"
+                    value={draft.reasoning}
+                    rows={3}
+                    placeholder="Why this version — which audience questions it answers."
+                    onChange={(e) => {
+                      const reasoning = e.target.value;
+                      onEditDraft((d) => ({ ...d, reasoning }));
+                    }}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      fontSize: 13.5,
+                      color: "var(--fg-muted)",
+                      lineHeight: 1.6,
+                      background: "var(--bg)",
+                      border: "1px solid var(--border-faint)",
+                      borderRadius: 2,
+                      padding: "10px 12px",
+                      outline: "none",
+                      resize: "vertical",
+                      fontFamily: "inherit",
+                    }}
+                  />
+
+                  {/* CAPTION — EDITABLE (a generated field, not a copy of the original). */}
+                  <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "20px 0 9px" }}>Caption</div>
+                  <textarea
+                    aria-label="Caption"
+                    value={draft.caption}
+                    rows={4}
+                    placeholder="Your caption."
+                    onChange={(e) => {
+                      const caption = e.target.value;
+                      onEditDraft((d) => ({ ...d, caption }));
+                    }}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      fontSize: 13.5,
+                      color: "var(--fg)",
+                      lineHeight: 1.6,
+                      border: "1px solid var(--border-faint)",
+                      borderRadius: 2,
+                      background: "var(--bg)",
+                      padding: "12px 14px",
+                      outline: "none",
+                      resize: "vertical",
+                      fontFamily: "inherit",
+                    }}
+                  />
                 </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
       </div>
@@ -1067,6 +2101,65 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
     <div style={{ background: "var(--bg-elevated)", padding: "12px 13px" }}>
       <div style={{ ...micro(9), letterSpacing: "0.1em" }}>{label}</div>
       <div style={{ fontFamily: "var(--font-mono)", fontSize: 18, marginTop: 3, color: accent ? "var(--accent)" : "var(--fg)" }}>{value}</div>
+    </div>
+  );
+}
+
+/**
+ * One mined FAQ: the canonical question + its three REAL-link-derived counts (support
+ * count / total likes / strength), expandable to the example Comments behind it (MAIN-969).
+ * support_count is the demand signal that makes "answer this in the remake" countable.
+ */
+function FaqItem({ faq }: { faq: FaqVM }) {
+  const [open, setOpen] = useState(false);
+  const hasExamples = faq.examples.length > 0;
+  return (
+    <div style={S.faqCard}>
+      <button
+        onClick={() => hasExamples && setOpen((o) => !o)}
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 11,
+          width: "100%",
+          background: "none",
+          border: "none",
+          padding: 0,
+          textAlign: "left",
+          cursor: hasExamples ? "pointer" : "default",
+          color: "inherit",
+        }}
+      >
+        <span style={{ fontFamily: "var(--font-serif)", fontSize: 26, lineHeight: 0.8, color: "var(--accent)", flex: "none" }}>?</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 500, color: "var(--fg)", lineHeight: 1.4 }}>{faq.question}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            <span style={S.faqCount}>{fmt(faq.supportCount)} asking</span>
+            <span style={S.faqCount}>{fmt(faq.supportLikes)} likes</span>
+            <span style={{ ...S.faqCount, color: "var(--accent)" }}>strength {faq.strengthScore.toFixed(1)}</span>
+            {hasExamples && (
+              <span style={{ ...micro(10), letterSpacing: "0.08em", marginLeft: "auto" }}>
+                {open ? "Hide" : `Show ${faq.examples.length}`} example{faq.examples.length === 1 ? "" : "s"}
+              </span>
+            )}
+          </div>
+        </div>
+      </button>
+      {open && hasExamples && (
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border-faint)", display: "flex", flexDirection: "column", gap: 9 }}>
+          {faq.examples.map((c, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 9 }}>
+              <span style={{ color: "var(--fg-faint)", flex: "none", marginTop: 1 }}>“</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: "var(--fg-muted)", lineHeight: 1.45 }}>{c.text}</div>
+                {c.username && (
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--fg-faint)", marginTop: 4 }}>@{c.username} · {c.likes} likes</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1420,9 +2513,11 @@ type IconName =
   | "message"
   | "back"
   | "bolt"
+  | "star"
+  | "archive"
   | "verified";
 
-function Icon({ name, size = 16, stroke = "currentColor", sw = 2 }: { name: IconName; size?: number; stroke?: string; sw?: number }) {
+function Icon({ name, size = 16, stroke = "currentColor", sw = 2, fill = "none" }: { name: IconName; size?: number; stroke?: string; sw?: number; fill?: string }) {
   const common = { width: size, height: size, viewBox: "0 0 24 24", fill: "none" as const };
   const lineProps = { stroke, strokeWidth: sw, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   switch (name) {
@@ -1486,6 +2581,20 @@ function Icon({ name, size = 16, stroke = "currentColor", sw = 2 }: { name: Icon
       return (
         <svg {...common} {...lineProps}>
           <path d="M13 2L3 14h9l-1 8 10-12h-9z" />
+        </svg>
+      );
+    case "star":
+      return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill={fill} {...lineProps}>
+          <path d="M12 2.5l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 21.4 6.1 20.9l1.1-6.5L2.5 9.8l6.5-.9z" />
+        </svg>
+      );
+    case "archive":
+      return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" {...lineProps}>
+          <rect x="3" y="4" width="18" height="4" rx="1" fill={fill} />
+          <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" />
+          <path d="M10 12h4" />
         </svg>
       );
     case "verified":

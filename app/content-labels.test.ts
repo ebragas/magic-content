@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeBeats, decodeComments, extractManychatKeywords, normalizeCommentText } from "./content-labels.js";
+import { commentRowsToVMs, decodeBeats, decodeComments, extractManychatKeywords, normalizeCommentText } from "./content-labels.js";
 
 const json = (comments: { username: string; text: string; likes?: number }[]) =>
   JSON.stringify(comments.map((c) => ({ likes: 0, ...c })));
@@ -114,6 +114,44 @@ describe("decodeComments — ManyChat filtering", () => {
       "saving this for later", // then by likes desc
       "This is so helpful, thank you!",
     ]);
+  });
+});
+
+describe("commentRowsToVMs — corpus display path (slice 968: exact is_trigger flag)", () => {
+  it("EXCLUDES is_trigger=1 Comments and keeps the rest (no fuzzy heuristic)", () => {
+    // The triggers are flagged in the store (is_trigger=1); the display path simply
+    // excludes them. A flagged comment that happens to be a question is still excluded
+    // (it fired the automation), while an UNflagged question survives.
+    const result = commentRowsToVMs([
+      { username: "a", text: "Loop", likes: 0, is_trigger: 1 },
+      { username: "b", text: "Loop", likes: 0, is_trigger: 1 },
+      { username: "c", text: "does this work on the free plan?", likes: 12, is_trigger: 0 },
+      { username: "itsmariahbrunner", text: "just sent!!", likes: 0, is_trigger: 0 },
+    ]);
+    expect(result.map((c) => c.text).sort()).toEqual([
+      "does this work on the free plan?",
+      "just sent!!",
+    ]);
+    expect(result.find((c) => c.text.startsWith("does"))!.isQuestion).toBe(true);
+  });
+
+  it("does NOT guess from the caption — an unflagged keyword-looking comment is kept", () => {
+    // The retired heuristic would have dropped "Loop"; the new path keeps it because
+    // it carries no is_trigger flag (the store decides, not a caption parse).
+    const result = commentRowsToVMs([
+      { username: "a", text: "Loop", likes: 0, is_trigger: 0 },
+      { username: "c", text: "real question here?", likes: 2, is_trigger: 0 },
+    ]);
+    expect(result.map((c) => c.text).sort()).toEqual(["Loop", "real question here?"]);
+  });
+
+  it("ranks questions first, then by likes (rows carry null likes safely)", () => {
+    const result = commentRowsToVMs([
+      { username: "a", text: "this is so helpful", likes: 5 },
+      { username: "b", text: "what model?", likes: null },
+      { username: "c", text: "saving this", likes: 40 },
+    ]);
+    expect(result.map((c) => c.text)).toEqual(["what model?", "saving this", "this is so helpful"]);
   });
 });
 
