@@ -2,6 +2,7 @@
   "name": "magic-content",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Local content-intelligence tool: scrape, analyze, and browse a creator's Instagram Reels.",
   "type": "module",
   "scripts": {

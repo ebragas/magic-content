@@ -18,3 +18,11 @@ next-env.d.ts
 
 # local agent worktrees (fix branches, throwaway checkouts)
 /.claude/worktrees
+
+# local Claude Code config (machine-specific permissions / env — never commit)
+/.claude/settings.local.json
+/.claude/settings.json
+
+# OS / editor cruft
+.DS_Store
+*.local
