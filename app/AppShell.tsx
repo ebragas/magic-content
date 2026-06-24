@@ -20,8 +20,8 @@
 // scripts, FAQ-aware reasoning, and a caption — Generate when none exists, Regenerate
 // (confirmed destructive full-replace) otherwise (POST /api/reels/{shortcode}/draft).
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, CSSProperties } from "react";
 import { useRouter } from "next/navigation";
 import type { AppData, CreatorVM, DraftVM, FaqVM, ReelVM } from "./dashboard-data.js";
 import { fmt, formatDuration } from "./content-labels.js";
@@ -1939,10 +1939,9 @@ function DetailView({
                         <span style={{ ...micro(9), letterSpacing: "0.08em", color: "var(--fg-faint)", flex: "none", marginTop: 7 }}>
                           {String.fromCharCode(65 + i)}
                         </span>
-                        <textarea
+                        <AutoTextarea
                           aria-label={`Hook option ${String.fromCharCode(65 + i)}`}
                           value={h.text}
-                          rows={2}
                           onChange={(e) => {
                             const text = e.target.value;
                             onEditDraft((d) => ({
@@ -1959,7 +1958,6 @@ function DetailView({
                             background: "transparent",
                             border: "none",
                             outline: "none",
-                            resize: "vertical",
                             fontFamily: "inherit",
                           }}
                         />
@@ -1991,11 +1989,12 @@ function DetailView({
                       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                         {draft.beatScripts.map((b, i) => (
                           <div key={`${b.label}-${i}`} style={{ display: "flex", alignItems: "flex-start", gap: 11 }}>
-                            <span style={S.beatTag}>{b.label}</span>
-                            <textarea
+                            <span style={{ flex: "none", width: 84, marginTop: 1 }}>
+                              <span style={S.beatTag}>{b.label}</span>
+                            </span>
+                            <AutoTextarea
                               aria-label={`Script for beat ${b.label}`}
                               value={b.script}
-                              rows={2}
                               placeholder="—"
                               onChange={(e) => {
                                 const script = e.target.value;
@@ -2014,7 +2013,6 @@ function DetailView({
                                 borderRadius: 2,
                                 padding: "8px 10px",
                                 outline: "none",
-                                resize: "vertical",
                                 fontFamily: "inherit",
                               }}
                             />
@@ -2026,10 +2024,9 @@ function DetailView({
 
                   {/* REASONING — EDITABLE. */}
                   <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "20px 0 9px" }}>Why this version</div>
-                  <textarea
+                  <AutoTextarea
                     aria-label="Reasoning"
                     value={draft.reasoning}
-                    rows={3}
                     placeholder="Why this version — which audience questions it answers."
                     onChange={(e) => {
                       const reasoning = e.target.value;
@@ -2037,7 +2034,6 @@ function DetailView({
                     }}
                     style={{
                       width: "100%",
-                      boxSizing: "border-box",
                       fontSize: 13.5,
                       color: "var(--fg-muted)",
                       lineHeight: 1.6,
@@ -2046,17 +2042,15 @@ function DetailView({
                       borderRadius: 2,
                       padding: "10px 12px",
                       outline: "none",
-                      resize: "vertical",
                       fontFamily: "inherit",
                     }}
                   />
 
                   {/* CAPTION — EDITABLE (a generated field, not a copy of the original). */}
                   <div style={{ ...micro(9), letterSpacing: "0.14em", margin: "20px 0 9px" }}>Caption</div>
-                  <textarea
+                  <AutoTextarea
                     aria-label="Caption"
                     value={draft.caption}
-                    rows={4}
                     placeholder="Your caption."
                     onChange={(e) => {
                       const caption = e.target.value;
@@ -2064,7 +2058,6 @@ function DetailView({
                     }}
                     style={{
                       width: "100%",
-                      boxSizing: "border-box",
                       fontSize: 13.5,
                       color: "var(--fg)",
                       lineHeight: 1.6,
@@ -2073,7 +2066,6 @@ function DetailView({
                       background: "var(--bg)",
                       padding: "12px 14px",
                       outline: "none",
-                      resize: "vertical",
                       fontFamily: "inherit",
                     }}
                   />
@@ -2432,6 +2424,27 @@ function summarize(r: PipelineResultLike): string {
 
 function micro(size: number): CSSProperties {
   return { fontFamily: "var(--font-mono)", fontSize: size, letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--fg-faint)" };
+}
+
+// A textarea that always equals its content height — no inner scrollbar, no drag handle.
+function AutoTextarea({ style, ...props }: ComponentProps<"textarea">) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  // Re-fit before paint on every value change (and on mount) so the box grows/shrinks with its text.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    // border-box height = content + padding (scrollHeight) + borders.
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+  }, [props.value]);
+  return (
+    <textarea
+      ref={ref}
+      rows={1}
+      {...props}
+      style={{ ...style, boxSizing: "border-box", resize: "none", overflow: "hidden" }}
+    />
+  );
 }
 
 function pillStyle(active: boolean): CSSProperties {
