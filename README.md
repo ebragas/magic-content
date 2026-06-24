@@ -1,5 +1,7 @@
 # Magic Content
 
+![The Magic Content dashboard — a sortable, filterable library of analyzed Instagram Reels](assets/dashboard.png)
+
 A content-intelligence system that scrapes a creator's Instagram Reels, analyzes each one with AI (Gemini transcription + visual/structural analysis), and surfaces — per Reel — what it was about and why it worked, so you can model a creator's approach on your own content. It's a durable library (a queryable Content Store + a dashboard), not a one-shot report generator.
 
 **Stack:** unified TypeScript (ADR-0005) — a Next.js app (dashboard + API), a TS CLI, and a shared pipeline core, all one language. SQLite via `better-sqlite3`, Apify via `apify-client`, Gemini via `@google/genai`, with an optional Anthropic leg (Claude) for FAQ clustering and draft generation.
