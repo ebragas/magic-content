@@ -19,6 +19,9 @@ next-env.d.ts
 # local agent worktrees (fix branches, throwaway checkouts)
 /.claude/worktrees
 
+# playwright-cli downloads (console logs, page dumps, screenshots — local-only)
+/.playwright-cli
+
 # local Claude Code config (machine-specific permissions / env — never commit)
 /.claude/settings.local.json
 /.claude/settings.json
